@@ -1,0 +1,2067 @@
+# pms_excel_app.py — Project Management System (Excel Prototype, Streamlit)
+# =============================================================================
+# 핵심 변경/개선 요약
+# - 문자열/옵션 안전화: _s, safe_select_options, safe_fmt_by 로 모든 selectbox 안전보장
+# - 날짜 유효성 전역 적용: end >= start (Projects/Tasks/Contracts/CSV Import)
+# - 파일 경로 일원화: BASE_DIR 고정 + os.chdir(BASE_DIR) → app/app 재귀 방지
+# - 기존 Excel 스키마 자동 보정(마이그레이션): NaN/NaT → "" 및 dtype 강제
+# - Streamlit 경고 제거: use_container_width → width='stretch'
+# - Contracts: 업로드 디스크 저장 + Excel 메타 기록 + 선택 ZIP 다운로드 + 삭제 동기화
+# =============================================================================
+
+# --- 경로/상수: 작업폴더를 바꾸지 않고, 파일 경로는 모두 절대경로로 계산한다. ---
+import os, sys
+from pathlib import Path
+
+# 스크립트 파일(pms_excel_app.py)이 실제로 있는 디렉터리
+if getattr(sys, 'frozen', False):  # pyinstaller 등
+    BASE_DIR = Path(sys.executable).resolve().parent
+else:
+    BASE_DIR = Path(__file__).resolve().parent  # streamlit 포함, 안전
+
+# "절대경로" 상수들 (절대경로만 씀. 상대경로 X)
+DATA_FILE = str((BASE_DIR / "pms_data.xlsx").resolve())
+LOCK_FILE = DATA_FILE + ".lock"
+UPLOAD_ROOT = str((BASE_DIR / "uploads").resolve())
+
+SHEET_PROJECTS        = "Projects"
+SHEET_TASKS           = "Tasks"
+SHEET_COMMENTS        = "Comments"
+SHEET_META            = "Meta"
+SHEET_CONTRACTS       = "Contracts"
+SHEET_BILLINGS        = "Billings"
+SHEET_CONTRACT_FILES  = "ContractFiles"
+SHEET_HUMANRES = "HumanResources" 
+
+
+# 나머지 옵션들은 기존 그대로…
+TASK_STATUS_OPTIONS    = ["To Do", "In Progress", "Blocked", "Done"]
+TASK_PRIORITY_OPTIONS  = ["Low", "Medium", "High", "Critical"]
+PROJECT_STATUS_OPTIONS = ["Planned", "Active", "On Hold", "Closed"]
+BILL_ITEM_OPTIONS = ["계약금", "중도금", "잔금"]
+YN_OPTIONS        = ["N", "Y"]
+CONTRACT_STATUS_OPTIONS = ["작성중", "체결완료", "진행중", "변경", "조기종료(중도해지)", "종료"]
+
+SESSION_PREFIX = "pmsx"
+def k(*parts): return f"{SESSION_PREFIX}_" + "_".join(map(lambda x: str(x).replace(' ', '_'), parts))
+# ---------------------------------------------------------------------------
+
+
+import re
+import io
+import zipfile
+import hashlib
+from datetime import datetime, date
+from dateutil.parser import parse as parse_dt
+
+import numpy as np
+import pandas as pd
+from filelock import FileLock
+import streamlit as st
+import plotly.express as px
+import streamlit.components.v1 as components
+
+# ───────── 설정 상수 ─────────
+# DATA_FILE = "pms_data.xlsx"
+# LOCK_FILE = DATA_FILE + ".lock"
+# UPLOAD_ROOT = "uploads"  # 업로드 파일 저장 루트 (프로젝트별 하위 폴더 사용)
+
+# SHEET_PROJECTS        = "Projects"
+#SHEET_TASKS           = "Tasks"
+#SHEET_COMMENTS        = "Comments"
+#SHEET_META            = "Meta"
+#SHEET_CONTRACTS       = "Contracts"      # 계약 헤더(기본 정보)
+#SHEET_BILLINGS        = "Billings"       # 수금 계획/실행
+#SHEET_CONTRACT_FILES  = "ContractFiles"  # 계약서 업로드 메타(디스크에 저장된 파일 경로 매핑)
+
+#TASK_STATUS_OPTIONS    = ["To Do", "In Progress", "Blocked", "Done"]
+#TASK_PRIORITY_OPTIONS  = ["Low", "Medium", "High", "Critical"]
+#PROJECT_STATUS_OPTIONS = ["Planned", "Active", "On Hold", "Closed"]
+
+#BILL_ITEM_OPTIONS = ["계약금", "중도금", "잔금"]
+#YN_OPTIONS        = ["N", "Y"]
+
+#CONTRACT_STATUS_OPTIONS = ["작성중", "체결완료", "진행중", "변경", "조기종료(중도해지)", "종료"]
+
+#SESSION_PREFIX = "pmsx"
+#def k(*parts): return f"{SESSION_PREFIX}_" + "_".join(map(lambda x: str(x).replace(' ', '_'), parts))
+
+# ───────── 문자열/옵션 안전 유틸 (selectbox 안정화의 핵심) ─────────
+def _s(x) -> str:
+    """어떤 값이 와도 반드시 '순수 str'로 반환 (NaN/NaT/numpy.str_ 포함)."""
+    try:
+        if x is None:
+            return ""
+        s = str(x).strip()
+        return "" if s.lower() in ("nan", "nat") else s
+    except Exception:
+        return ""
+
+def safe_select_options(series: pd.Series) -> list[str]:
+    """selectbox options를 반드시 '빈값 제거된 str 리스트'로 보정."""
+    if series is None or len(series) == 0:
+        return []
+    vals = series.astype(object).map(_s).tolist()
+    return [v for v in vals if v]
+
+def safe_fmt_by(df: pd.DataFrame, key_col: str, value_col: str):
+    """
+    selectbox의 format_func로 쓰기 좋은 안전 포맷터.
+    df[key_col]==x인 행의 value_col을 찾아 'str'로 반환. 실패 시 x 자체를 str로.
+    """
+    def _fmt(x):
+        try:
+            kcol = df.get(key_col)
+            if kcol is None:
+                return _s(x)
+            mask = kcol.astype(object).map(_s) == _s(x)
+            if mask.any():
+                val = df.loc[mask, value_col].iloc[0] if value_col in df.columns else ""
+                sv = _s(val)
+                return sv if sv else _s(x)
+            return _s(x)
+        except Exception:
+            return _s(x)
+    return _fmt
+
+# ───────── 공통 유틸 ─────────
+def _now_iso(): return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+def _safe_date_str(d):
+    """입력이 datetime/date/str 모두 가능. 파싱 실패→빈 문자열."""
+    if pd.isna(d) or d is None: return ""
+    if isinstance(d, (datetime, date)): return d.strftime("%Y-%m-%d")
+    try: return parse_dt(str(d)).strftime("%Y-%m-%d")
+    except Exception: return ""
+
+def _parse_date_maybe(d):
+    """빈값/파싱 실패는 None 반환."""
+    s = _safe_date_str(d)
+    if not s: return None
+    try:
+        return parse_dt(s).date()
+    except Exception:
+        return None
+
+def _to_dt_or_nat(x):
+    try: return pd.to_datetime(x) if str(x).strip() else pd.NaT
+    except Exception: return pd.NaT
+
+def _parse_int_from_krw_strict(s):
+    if s is None: return 0
+    s = "".join(ch for ch in str(s) if ch.isdigit())
+    if s == "": return 0
+    try: return int(s)
+    except Exception: return 0
+
+
+def scroll_to(anchor_id: str, offset: int = 72):
+    """화면 스크롤 유틸: 특정 요소로 부드럽게 스크롤."""
+    components.html(
+        f"""
+        <script>
+        (function() {{
+          function tryScroll(rootDoc) {{
+            if (!rootDoc) return false;
+            var el = rootDoc.getElementById("{anchor_id}");
+            if (!el) return false;
+            try {{ el.scrollIntoView({{ behavior: 'smooth', block: 'start' }}); }} catch(e) {{}}
+            var rect = el.getBoundingClientRect();
+            var top = rect.top + (rootDoc.defaultView ? rootDoc.defaultView.pageYOffset : window.pageYOffset) - {offset};
+            var targets = [rootDoc.scrollingElement, rootDoc.querySelector('[data-testid="stAppViewContainer"]'), rootDoc.querySelector('section.main'), rootDoc.body].filter(Boolean);
+            for (var i=0;i<targets.length;i++) {{ try {{ targets[i].scrollTo({{top: top, left: 0, behavior:'smooth'}}); return true; }} catch(e){{}} }}
+            try {{ (rootDoc.defaultView || window).scrollTo({{top: top, left:0, behavior:'smooth'}}); return true; }} catch(e){{}}
+            try {{ if (window.parent && window.parent!==window) {{ window.parent.scrollTo({{top: top, left:0, behavior:'smooth'}}); return true; }} }} catch(e){{}}
+            return false;
+          }}
+          function go() {{
+            if (tryScroll(document)) return true;
+            try {{ if (window.parent && window.parent.document) return tryScroll(window.parent.document); }} catch(e){{}}
+            return false;
+          }}
+          if (!go()) setTimeout(go, 80);
+          if (!go()) setTimeout(go, 240);
+          if (!go()) setTimeout(go, 600);
+        }})();
+        </script>
+        """,
+        height=1,
+    )
+
+# 파일 업로드 묶음 시그니처 (중복 업로드 재실행 방지, 업로더 리런 시 중복 방지용)
+def _files_signature(files):
+    if not files: return None
+    sig_parts = []
+    for f in files:
+        try: b = f.getbuffer()
+        except Exception: b = bytes(str(f.name), "utf-8")
+        b = bytes(b)
+        sig_parts.append((f.name, len(b), hashlib.sha1(b[:1024*1024]).hexdigest()))
+    return tuple(sorted(sig_parts))
+
+# 업무일(토/일 제외, 양끝 포함)
+def business_days_inclusive(start_d: date, end_d: date) -> int:
+    if start_d is None or end_d is None: return 0
+    s, e = (start_d, end_d) if start_d <= end_d else (end_d, start_d)
+    s64, e64 = np.datetime64(s), np.datetime64(e)
+    count = np.busday_count(s64, e64) + (1 if np.is_busday(e64) else 0)
+    return int(max(0, count))
+
+# ───────── 초기화/입출력 ─────────
+def _ensure_excel_initialized():
+    """엑셀 파일/시트가 없으면 생성. uploads 폴더 생성."""
+    if not os.path.exists(DATA_FILE):
+        with pd.ExcelWriter(DATA_FILE, engine="openpyxl") as w:
+            pd.DataFrame(columns=[
+                "project_id","project_code","name","owner","sponsor","status",
+                "contract_amount","start_date","end_date","created_at","updated_at"
+            ]).to_excel(w, index=False, sheet_name=SHEET_PROJECTS)
+
+            pd.DataFrame(columns=[
+                "task_id","project_id","parent_task_id","title","description","assignee",
+                "priority","status","start_date","due_date","estimate_days","labels",
+                "progress"
+            ]).to_excel(w, index=False, sheet_name=SHEET_TASKS)
+
+            pd.DataFrame(columns=[
+                "comment_id","entity_type","entity_id","author","body","created_at"
+            ]).to_excel(w, index=False, sheet_name=SHEET_COMMENTS)
+
+            pd.DataFrame({
+                "key":   ["project_id_seq","task_id_seq","comment_id_seq","bill_id_seq","file_id_seq"],
+                "value": [1,1,1,1,1]
+            }).to_excel(w, index=False, sheet_name=SHEET_META)
+
+            pd.DataFrame(columns=[
+                "contract_id","project_id","contractor","customer","contract_name",
+                "period_start","period_end","contract_amount","contract_status",
+                "created_at","updated_at"
+            ]).to_excel(w, index=False, sheet_name=SHEET_CONTRACTS)
+
+            pd.DataFrame(columns=[
+                "bill_id","project_id","item","amount","due_date","request","note",
+                "created_at","updated_at"
+            ]).to_excel(w, index=False, sheet_name=SHEET_BILLINGS)
+
+
+            pd.DataFrame(columns=[
+                "no", "project_id", "project_name", "member_name", "department_role",
+                "position_skill", "start_date", "end_date", "allocation_rate",
+                "planned_md", "actual_md", "cost_unit", "planned_cost",
+                "actual_cost", "role", "main_task",
+                "diff_md", "diff_cost", "remark"
+            ]).to_excel(w, index=False, sheet_name=SHEET_HUMANRES)
+
+
+
+
+            # 파일 메타: 디스크 경로(path) 포함
+            pd.DataFrame(columns=[
+                "file_id","project_id","filename","path","note","uploaded_at","file_hash"
+            ]).to_excel(w, index=False, sheet_name=SHEET_CONTRACT_FILES)
+
+    os.makedirs(UPLOAD_ROOT, exist_ok=True)
+
+def _with_lock(fn, *args, **kwargs):
+    with FileLock(LOCK_FILE, timeout=10):
+        return fn(*args, **kwargs)
+
+def _read_all():
+    def _read():
+        xl = pd.ExcelFile(DATA_FILE)
+        p  = pd.read_excel(xl, sheet_name=SHEET_PROJECTS)
+        t  = pd.read_excel(xl, sheet_name=SHEET_TASKS)
+        c  = pd.read_excel(xl, sheet_name=SHEET_COMMENTS)
+        m  = pd.read_excel(xl, sheet_name=SHEET_META)
+        ct = pd.read_excel(xl, sheet_name=SHEET_CONTRACTS) if SHEET_CONTRACTS in xl.sheet_names else pd.DataFrame()
+        bl = pd.read_excel(xl, sheet_name=SHEET_BILLINGS)  if SHEET_BILLINGS  in xl.sheet_names else pd.DataFrame()
+        cf = pd.read_excel(xl, sheet_name=SHEET_CONTRACT_FILES) if SHEET_CONTRACT_FILES in xl.sheet_names else pd.DataFrame()
+        hr = pd.read_excel(xl, sheet_name=SHEET_HUMANRES) if SHEET_HUMANRES in xl.sheet_names else pd.DataFrame()
+        return p, t, c, m, ct, bl, cf, hr
+
+    return _with_lock(_read)
+
+
+
+
+def _write_all(df_p, df_t, df_c, df_m, df_ct, df_bl, df_cf, df_hr):
+    def _write():
+        with pd.ExcelWriter(DATA_FILE, engine="openpyxl", mode="w") as w:
+            df_p.to_excel(w, index=False, sheet_name=SHEET_PROJECTS)
+            df_t.to_excel(w, index=False, sheet_name=SHEET_TASKS)
+            df_c.to_excel(w, index=False, sheet_name=SHEET_COMMENTS)
+            df_m.to_excel(w, index=False, sheet_name=SHEET_META)
+            df_ct.to_excel(w, index=False, sheet_name=SHEET_CONTRACTS)
+            df_bl.to_excel(w, index=False, sheet_name=SHEET_BILLINGS)
+            df_cf.to_excel(w, index=False, sheet_name=SHEET_CONTRACT_FILES)
+            df_hr.to_excel(w, index=False, sheet_name=SHEET_HUMANRES)  # ← 추가
+    _with_lock(_write)
+
+
+def _next_id(df_meta, key):
+    row = df_meta.loc[df_meta["key"] == key]
+    if row.empty:
+        df_meta.loc[len(df_meta)] = {"key": key, "value": 1}
+        return 1, df_meta
+    val = int(row["value"].values[0])
+    df_meta.loc[df_meta["key"] == key, "value"] = val + 1
+    return val, df_meta
+
+# ───────── 마이그레이션/보정 (스키마·dtype·NaN 정리 + 계약ID 보정) ─────────
+TASK_ID_RE = re.compile(r"^(?P<pid>.+)_tsk_(?P<num>\d{3})$")
+
+def _next_project_task_id(df_t: pd.DataFrame, project_id: str) -> str:
+    proj = _s(project_id)
+    sufmax = 0
+    if not df_t.empty and "task_id" in df_t.columns:
+        subset = df_t[df_t.get("project_id", "").astype(str) == proj]["task_id"].astype(str)
+        for tid in subset:
+            m = TASK_ID_RE.match(str(tid))
+            if m and m.group("pid") == proj:
+                sufmax = max(sufmax, int(m.group("num")))
+    return f"{proj}_tsk_{sufmax+1:03d}"
+
+def _normalize_task_ids(df_t: pd.DataFrame) -> tuple[pd.DataFrame, bool]:
+    if df_t is None or df_t.empty: return df_t, False
+    changed = False
+    df_t = df_t.copy()
+    for col in ["project_id","task_id"]:
+        if col not in df_t.columns:
+            df_t[col] = ""
+            changed = True
+    df_t["project_id"] = df_t["project_id"].astype(object).map(_s)
+    df_t["task_id"]    = df_t["task_id"].astype(object).map(_s)
+
+    for idx, row in df_t.iterrows():
+        pid = _s(row.get("project_id",""))
+        tid = _s(row.get("task_id",""))
+        if not pid: continue
+        m = TASK_ID_RE.match(tid)
+        if m and m.group("pid") == pid:
+            continue
+        new_tid = _next_project_task_id(df_t, pid)
+        if new_tid != tid:
+            df_t.at[idx, "task_id"] = new_tid
+            changed = True
+    return df_t, changed
+
+def _renumber_project_tasks(df_t: pd.DataFrame, df_c: pd.DataFrame, project_id: str) -> tuple[pd.DataFrame, pd.DataFrame]:
+    pid = _s(project_id)
+    tsub = df_t[df_t["project_id"].astype(str) == pid].copy()
+    if tsub.empty: return df_t, df_c
+    tsub["_sd"] = pd.to_datetime(tsub.get("start_date",""), errors="coerce")
+    tsub["_dd"] = pd.to_datetime(tsub.get("due_date",""), errors="coerce")
+    tsub = tsub.sort_values(by=["_sd","_dd","task_id"], ascending=[True,True,True]).drop(columns=["_sd","_dd"])
+    mapping = {}
+    counter = 1
+    for idx in tsub.index:
+        old_tid = _s(df_t.at[idx, "task_id"])
+        new_tid = f"{pid}_tsk_{counter:03d}"
+        if new_tid != old_tid:
+            mapping[old_tid] = new_tid
+            df_t.at[idx, "task_id"] = new_tid
+        counter += 1
+    if mapping and not df_c.empty and "entity_type" in df_c.columns and "entity_id" in df_c.columns:
+        mask = df_c["entity_type"].astype(object).map(_s).str.lower().eq("task") & df_c["entity_id"].astype(object).map(_s).isin(mapping.keys())
+        if mask.any():
+            df_c.loc[mask, "entity_id"] = df_c.loc[mask, "entity_id"].astype(object).map(_s).map(lambda x: mapping.get(x, x))
+    return df_t, df_c
+
+def _migrate_schema(df_p, df_t, df_c, df_ct, df_bl, df_cf, df_hr):
+    changed = False
+
+    # 인력관리(HumanResources)
+    hr_cols = [
+        "no", "project_id", "project_name", "member_name", "department_role",
+        "position_skill", "start_date", "end_date", "allocation_rate",
+        "planned_md", "actual_md", "cost_unit", "planned_cost",
+        "actual_cost", "role", "main_task", "diff_md", "diff_cost", "remark"
+    ]
+    for c in hr_cols:
+        if c not in df_hr.columns:
+            df_hr[c] = ""
+            changed = True
+
+    # dtype 보정
+    for c in ["allocation_rate","planned_md","actual_md","cost_unit","planned_cost","actual_cost","diff_md","diff_cost"]:
+        if c in df_hr.columns:
+            df_hr[c] = pd.to_numeric(df_hr[c], errors="coerce").fillna(0).astype(float)
+    for c in ["no","project_id","project_name","member_name","department_role","position_skill","role","main_task","remark","start_date","end_date"]:
+        if c in df_hr.columns:
+            df_hr[c] = df_hr[c].astype(object).map(_s)
+    return df_p, df_t, df_c, df_ct, df_bl, df_cf, df_hr, changed
+
+    # Projects
+    for col, default in [("sponsor",""), ("contract_amount",0), ("created_at",""), ("updated_at","")]:
+        if col not in df_p.columns:
+            df_p[col] = default; changed = True
+    # 문자열화 (NaN/NaT 제거)
+    for col in ["project_id","project_code","name","owner","sponsor","status","start_date","end_date","created_at","updated_at"]:
+        if col in df_p.columns:
+            df_p[col] = df_p[col].astype(object).map(_s)
+    df_p["contract_amount"] = pd.to_numeric(df_p.get("contract_amount", 0), errors="coerce").fillna(0).astype(int)
+
+    # Tasks
+    req = ["project_id","task_id","title","description","assignee","priority","status","start_date","due_date","estimate_days","labels","progress","parent_task_id"]
+    for col in req:
+        if col not in df_t.columns:
+            df_t[col] = "" if col not in ["estimate_days","progress"] else 0
+            changed = True
+    for col in ["project_id","task_id","title","description","assignee","priority","status","labels","start_date","due_date","created_at","updated_at","parent_task_id"]:
+        if col in df_t.columns:
+            df_t[col] = df_t[col].astype(object).map(_s)
+    df_t["progress"] = pd.to_numeric(df_t.get("progress", 0), errors="coerce").fillna(0).clip(0,100).astype(int)
+    df_t["estimate_days"] = pd.to_numeric(df_t.get("estimate_days", 0.0), errors="coerce").fillna(0).astype(float)
+
+    # Comments
+    for col in ["entity_type","entity_id","author","body","created_at"]:
+        if col in df_c.columns:
+            df_c[col] = df_c[col].astype(object).map(_s)
+
+    # Contracts
+    ct_cols = ["contract_id","project_id","contractor","customer","contract_name","period_start","period_end","contract_amount","contract_status","created_at","updated_at"]
+    for c in ct_cols:
+        if c not in df_ct.columns:
+            df_ct[c] = "" if c != "contract_amount" else 0
+            changed = True
+    for c in ct_cols:
+        if c in df_ct.columns:
+            if c == "contract_amount":
+                df_ct[c] = pd.to_numeric(df_ct[c], errors="coerce").fillna(0).astype(int)
+            else:
+                df_ct[c] = df_ct[c].astype(object).map(_s)
+
+    # Billings
+    bl_cols = ["bill_id","project_id","item","amount","due_date","request","note","created_at","updated_at"]
+    for c in bl_cols:
+        if c not in df_bl.columns:
+            df_bl[c] = "" if c not in ["bill_id","amount"] else 0
+            changed = True
+    if not df_bl.empty:
+        df_bl["bill_id"]    = pd.to_numeric(df_bl.get("bill_id", 0), errors="coerce").fillna(0).astype(int)
+        df_bl["amount"]     = pd.to_numeric(df_bl.get("amount", 0), errors="coerce").fillna(0).astype(int)
+    for c in ["project_id","item","due_date","request","note","created_at","updated_at"]:
+        if c in df_bl.columns:
+            df_bl[c] = df_bl[c].astype(object).map(_s)
+    df_bl["item"]    = df_bl["item"].replace("", "중도금")
+    df_bl["request"] = df_bl["request"].map(lambda x: "Y" if _s(x).upper()=="Y" else "N")
+
+    # Contract Files (디스크 경로 path 포함)
+    cf_cols = ["file_id","project_id","filename","path","note","uploaded_at","file_hash"]
+    for c in cf_cols:
+        if c not in df_cf.columns:
+            df_cf[c] = "" if c != "file_id" else 0
+            changed = True
+    if not df_cf.empty:
+        df_cf["file_id"] = pd.to_numeric(df_cf.get("file_id", 0), errors="coerce").fillna(0).astype(int)
+    for c in ["project_id","filename","path","note","uploaded_at","file_hash"]:
+        if c in df_cf.columns:
+            df_cf[c] = df_cf[c].astype(object).map(_s)
+
+    # 계약ID 자동 보정 (NaN/빈값 → 규칙 채번 AICESS-YYMMDDNN)
+    for idx, row in df_ct.iterrows():
+        if not _s(row.get("contract_id","")):
+            proj_id = _s(row.get("project_id",""))
+            # Projects.created_at 또는 start_date 활용
+            p_row = df_p[df_p["project_id"].astype(str) == proj_id]
+            base_dt = None
+            if not p_row.empty:
+                created = _s(p_row.iloc[0].get("created_at",""))
+                if created:
+                    try: base_dt = parse_dt(created).date()
+                    except Exception: pass
+            if base_dt is None:
+                sdate = _s(p_row.iloc[0].get("start_date","")) if not p_row.empty else ""
+                if sdate:
+                    try: base_dt = parse_dt(sdate).date()
+                    except Exception: pass
+            if base_dt is None: base_dt = date.today()
+            ymd = base_dt.strftime("%y%m%d")
+            prefix = f"AICESS-{ymd}"
+            exists = df_ct[df_ct["contract_id"].astype(str).str.startswith(prefix)]
+            nn = 1
+            if not exists.empty:
+                nums = []
+                for cid in exists["contract_id"].astype(str):
+                    tail = cid.replace(prefix, "")
+                    try: nums.append(int(tail))
+                    except: pass
+                if nums: nn = max(nums) + 1
+            df_ct.at[idx, "contract_id"] = f"{prefix}{nn:02d}"
+            changed = True
+
+    return df_p, df_t, df_c, df_ct, df_bl, df_cf, changed
+
+# ───────── 프로젝트 목록 표시 테이블(잔여기간/계약금액 숫자 유지) ─────────
+def _build_project_display_numeric(df: pd.DataFrame) -> pd.DataFrame:
+    disp = df.copy()
+    disp["start_date"] = pd.to_datetime(disp.get("start_date", pd.NaT), errors="coerce")
+    disp["end_date"]   = pd.to_datetime(disp.get("end_date",   pd.NaT), errors="coerce")
+    delta = disp["end_date"] - disp["start_date"]
+    disp["잔여기간"] = delta.dt.days.fillna(0).astype(int)
+    base_order = [
+        "project_id","project_code","name","owner","sponsor","status",
+        "start_date","end_date","잔여기간","contract_amount"
+    ]
+    cols = [c for c in base_order if c in disp.columns]
+    disp = disp[cols].copy().rename(columns={
+        "name": "사업명", "owner": "Owner", "sponsor": "Sponsor", "status": "Status",
+        "start_date": "Start", "end_date": "End", "contract_amount": "계약금액",
+    })
+    disp.index = range(1, len(disp) + 1)
+    disp.index.name = ""
+    return disp
+
+def _calc_collected_by_project(df_bl):
+    if df_bl.empty: return {}
+    d = df_bl[df_bl["request"].astype(str).str.upper() == "Y"].copy()
+    grp = d.groupby(d["project_id"].astype(str))["amount"].sum()
+    return grp.to_dict()
+
+# ───────── 앱 시작 ─────────
+st.set_page_config(page_title="PMS (Excel Prototype)", layout="wide")
+st.title("🗂️ Project Management System — Excel Prototype (Excel Storage)")
+
+_ensure_excel_initialized()
+df_p, df_t, df_c, df_m, df_ct, df_bl, df_cf, df_hr = _read_all()
+df_p, df_t, df_c, df_ct, df_bl, df_cf, df_hr, schema_changed = _migrate_schema(df_p, df_t, df_c, df_ct, df_bl, df_cf, df_hr)
+df_t, t_changed = _normalize_task_ids(df_t)
+if schema_changed or t_changed:
+    _write_all(df_p, df_t, df_c, df_m, df_ct, df_bl, df_cf, df_hr)
+
+# Tabs
+tab_dashboard, tab_projects, tab_contracts, tab_hr, tab_tasks, tab_board, tab_gantt, tab_comments, tab_import = st.tabs(
+    ["📊 Dashboard", "📁 Projects", "📑 Contracts", "👥 Human Resources", "🧩 Tasks", "🗂️ Kanban", "📅 Gantt (Due)", "💬 Comments", "📥 Import/Export"]
+)
+
+
+# ───────── Dashboard ─────────
+with tab_dashboard:
+    st.subheader("프로젝트 현황 요약")
+
+    total_projects   = len(df_p)
+    active_projects  = len(df_p[df_p["status"] == "Active"])
+    planned_projects = len(df_p[df_p["status"] == "Planned"])
+    total_tasks      = len(df_t)
+    status_counts    = df_t["status"].value_counts().reindex(TASK_STATUS_OPTIONS, fill_value=0)
+
+    total_contract = int(df_p["contract_amount"].sum()) if not df_p.empty else 0
+    collected_all  = int(df_bl.loc[df_bl["request"].astype(str).str.upper()=="Y","amount"].sum()) if not df_bl.empty else 0
+    total_balance_due = max(0, total_contract - collected_all)
+
+    m1, m2, m3, m4, m5, m6 = st.columns(6)
+    with m1: st.metric("전체 프로젝트", total_projects)
+    with m2: st.metric("진행중인 프로젝트", active_projects)
+    with m3: st.metric("준비중인 프로젝트", planned_projects)
+    with m4: st.metric("전체 작업 수", total_tasks)
+    with m5: st.metric("계약금액 합계(₩)", f"{total_contract:,}")
+    with m6: st.metric("잔금 합계(₩)", f"{total_balance_due:,}")
+
+    st.markdown("### 📋 프로젝트 목록 (Active + Planned)")
+    dash_df = df_p[df_p["status"].isin(["Active","Planned"])].copy()
+    if dash_df.empty:
+        st.info("Active 또는 Planned 상태의 프로젝트가 없습니다.")
+    else:
+        blY = df_bl[df_bl["request"].astype(str).str.upper() == "Y"].copy() if not df_bl.empty else pd.DataFrame(columns=["project_id","amount"])
+        per_proj_collected = blY.groupby(blY["project_id"].astype(str))["amount"].sum().astype(int) if not blY.empty else pd.Series(dtype=int)
+        dash_disp = _build_project_display_numeric(dash_df)
+
+        def _proj_balance(pid: str, amt: int) -> int:
+            got = int(per_proj_collected.get(str(pid), 0)) if len(per_proj_collected) else 0
+            return max(0, int(amt) - got)
+
+        dash_disp["잔금"] = [
+            _proj_balance(pid, amt)
+            for pid, amt in zip(dash_disp["project_id"].astype(str), dash_disp["계약금액"])
+        ]
+        dash_disp["계약금액(KRW)"] = dash_disp["계약금액"].apply(lambda x: f"{int(x):,}" if pd.notna(x) else "")
+        dash_disp["잔금(KRW)"]   = dash_disp["잔금"].apply(lambda x: f"{int(x):,}" if pd.notna(x) else "")
+        dash_cols = ["project_id","project_code","사업명","Owner","Sponsor","Status","Start","End","잔여기간","계약금액(KRW)","잔금(KRW)"]
+        dash_cols = [c for c in dash_cols if c in dash_disp.columns]
+        st.dataframe(dash_disp[dash_cols], width='stretch', height=360)
+
+        st.divider()
+        st.caption("작업 상태 분포")
+        chart_df = pd.DataFrame({"Status": status_counts.index, "Count": status_counts.values})
+        fig = px.bar(chart_df, x="Status", y="Count", text="Count")
+        fig.update_traces(textposition="outside")
+        fig.update_layout(margin=dict(l=0, r=0, t=24, b=0))
+        st.plotly_chart(fig, config={"displaylogo": False}, use_container_width=True)
+
+# ───────── Projects ─────────
+with tab_projects:
+    st.subheader("프로젝트")
+
+    # 버튼 줄
+    b1, b2, _sp = st.columns([0.18,0.18,0.64], gap="small")
+    with b1:
+        if st.button("➕ 프로젝트 추가/수정", key=k("proj","open_form_btn")):
+            st.session_state[k("proj","show_form")] = True
+            st.session_state[k("proj","do_scroll")] = True
+            st.rerun()
+    with b2:
+        if st.button("🗑 선택 삭제", key=k("proj","bulk_delete_btn")):
+            st.session_state[k("proj","trigger_delete")] = True
+
+    st.markdown("### 프로젝트 목록")
+    disp = _build_project_display_numeric(df_p)
+    disp.insert(0, "선택", False)
+    column_order = ["선택","project_id","project_code","사업명","Owner","Sponsor","Status","Start","End","잔여기간","계약금액"]
+    edited = st.data_editor(
+        disp,
+        column_order=[c for c in column_order if c in disp.columns],
+        column_config={
+            "선택": st.column_config.CheckboxColumn("선택", width="small", help="삭제할 프로젝트 선택"),
+            "계약금액": st.column_config.NumberColumn("계약금액"),
+            "잔여기간": st.column_config.NumberColumn("잔여기간")
+        },
+        disabled=[c for c in disp.columns if c != "선택"],
+        width='stretch', height=430, hide_index=True,
+        key=k("proj","editor","list")
+    )
+    st.caption("칼럼 헤더 클릭으로 정렬 토글 (▲/▼)")
+
+    selected_pids = edited.loc[edited["선택"] == True, "project_id"].astype(str).tolist() if "project_id" in edited.columns else []
+
+    if st.session_state.get(k("proj","trigger_delete"), False):
+        st.session_state[k("proj","trigger_delete")] = False
+        if not selected_pids:
+            st.warning("선택된 프로젝트가 없습니다.")
+        else:
+            st.session_state[k("proj","pending_delete_pids")] = selected_pids
+            st.session_state[k("proj","show_confirm")] = True
+            st.rerun()
+
+    if st.session_state.get(k("proj","show_confirm"), False):
+        pending = st.session_state.get(k("proj","pending_delete_pids"), [])
+        st.warning(f"선택한 {len(pending)}개 프로젝트와 연결된 모든 작업/코멘트를 삭제합니다. 진행하시겠습니까?")
+        cA, cB = st.columns([1,1])
+        with cA:
+            if st.button("✅ 예, 삭제합니다", key=k("proj","bulk_delete_yes")):
+                pids = [str(x) for x in pending]
+                df_p = df_p[~df_p["project_id"].astype(str).isin(pids)]
+                del_tasks = df_t[df_t["project_id"].astype(str).isin(pids)]
+                df_t = df_t[~df_t["project_id"].astype(str).isin(pids)]
+                df_c = df_c[~((df_c["entity_type"].astype(object).map(_s).str.lower()=="project") & (df_c["entity_id"].astype(object).map(_s).isin(pids)))]
+                if not del_tasks.empty:
+                    tids = del_tasks["task_id"].astype(str).tolist()
+                    df_c = df_c[~((df_c["entity_type"].astype(object).map(_s).str.lower()=="task") & (df_c["entity_id"].astype(object).map(_s).isin(tids)))]
+                df_ct = df_ct[~df_ct["project_id"].astype(str).isin(pids)]
+                df_bl = df_bl[~df_bl["project_id"].astype(str).isin(pids)]
+                # 파일 메타/디스크도 함께 정리
+                del_files = df_cf[df_cf["project_id"].astype(str).isin(pids)]
+                for _, r in del_files.iterrows():
+                    pth = _s(r.get("path",""))
+                    if pth and os.path.isfile(pth):
+                        try: os.remove(pth)
+                        except: pass
+                df_cf = df_cf[~df_cf["project_id"].astype(str).isin(pids)]
+                _write_all(df_p, df_t, df_c, df_m, df_ct, df_bl, df_cf, df_hr)
+                st.session_state[k("proj","pending_delete_pids")] = []
+                st.session_state[k("proj","show_confirm")] = False
+                st.success("삭제되었습니다.")
+                st.rerun()
+        with cB:
+            if st.button("취소", key=k("proj","bulk_delete_cancel")):
+                st.session_state[k("proj","pending_delete_pids")] = []
+                st.session_state[k("proj","show_confirm")] = False
+                st.info("삭제가 취소되었습니다.")
+                st.rerun()
+
+    if k("proj","show_form") not in st.session_state:
+        st.session_state[k("proj","show_form")] = False
+    if st.session_state.get(k("proj","show_form"), False):
+        st.markdown("---")
+        st.markdown("<div id='projform'></div>", unsafe_allow_html=True)
+        if st.session_state.get(k("proj","do_scroll"), False):
+            scroll_to("projform")
+            st.session_state[k("proj","do_scroll")] = False
+
+        st.markdown("### 프로젝트 추가/수정")
+        if st.button("닫기", key=k("proj","close_form")):
+            st.session_state[k("proj","show_form")] = False
+            st.rerun()
+
+        left, right = st.columns(2)
+        with left:
+            edit_mode = st.toggle("수정 모드", value=False, key=k("proj","edit_mode"))
+            selected_project_id = None
+            if edit_mode and not df_p.empty:
+                selected_project_id = st.selectbox(
+                    "수정할 프로젝트",
+                    options=safe_select_options(df_p["project_id"]),
+                    format_func=safe_fmt_by(df_p, "project_id", "name"),
+                    key=k("proj","select_edit")
+                )
+
+        def _project_form_defaults(row=None):
+            return {
+                "project_id": (_s(row.get("project_id","")) if row is not None else ""),
+                "project_code": (_s(row.get("project_code","")) if row is not None else ""),
+                "name": (_s(row.get("name","")) if row is not None else ""),
+                "owner": (_s(row.get("owner","")) if row is not None else ""),
+                "sponsor": (_s(row.get("sponsor","")) if row is not None else ""),
+                "status": (_s(row.get("status","Active")) if row is not None else "Active"),
+                "start_date": parse_dt(_safe_date_str(row.get("start_date"))) if (row is not None and _safe_date_str(row.get("start_date"))) else date.today(),
+                "end_date": parse_dt(_safe_date_str(row.get("end_date"))) if (row is not None and _safe_date_str(row.get("end_date"))) else date.today(),
+                "contract_amount": f"{int(pd.to_numeric(row.get('contract_amount',0), errors='coerce') or 0):,}" if row is not None else "",
+            }
+
+        # --- 수정 모드 ---
+        if edit_mode and selected_project_id is not None:
+            row = df_p[df_p["project_id"].astype(str) == str(selected_project_id)].iloc[0].to_dict()
+            d = _project_form_defaults(row)
+            with st.form(key=k("proj","edit_form",selected_project_id), clear_on_submit=False):
+                colA, colB = st.columns(2)
+                with colA:
+                    new_pid     = st.text_input("project_id (문자/숫자 허용, 변경 시 연결 데이터도 변경)", value=d["project_id"], key=k("proj","id_edit",selected_project_id))
+                    project_code= st.text_input("Project Code", value=d["project_code"], key=k("proj","code_edit",selected_project_id))
+                    name        = st.text_input("사업명", value=d["name"], key=k("proj","name_edit",selected_project_id))
+                    owner       = st.text_input("Owner", value=d["owner"], key=k("proj","owner_edit",selected_project_id))
+                    sponsor     = st.text_input("Sponsor", value=d["sponsor"], key=k("proj","sponsor_edit",selected_project_id))
+                with colB:
+                    status      = st.selectbox("Status", options=PROJECT_STATUS_OPTIONS,
+                                               index=PROJECT_STATUS_OPTIONS.index(d["status"]) if d["status"] in PROJECT_STATUS_OPTIONS else 1,
+                                               key=k("proj","status_edit",selected_project_id))
+                    start_date  = st.date_input("Start", value=d["start_date"].date() if isinstance(d["start_date"], datetime) else d["start_date"], key=k("proj","start_edit",selected_project_id))
+                    end_date    = st.date_input("End",   value=d["end_date"].date()   if isinstance(d["end_date"],   datetime) else d["end_date"],   key=k("proj","end_edit",selected_project_id))
+                    amt_in      = st.text_input("계약금액 (KRW, 숫자만)", value=d["contract_amount"], placeholder="예: 150000000", key=k("proj","amt_edit",selected_project_id))
+                submitted = st.form_submit_button("저장(수정)")
+
+                # 날짜 유효성 검사: End >= Start
+                if submitted:
+                    if end_date < start_date:
+                        st.error("⚠️ 종료일(End)은 시작일(Start)보다 이전일 수 없습니다.")
+                        st.stop()
+                    new_pid = _s(new_pid)
+                    if new_pid == "":
+                        st.error("project_id는 비울 수 없습니다."); st.stop()
+                    amt_val = _parse_int_from_krw_strict(amt_in)
+                    old_pid = _s(selected_project_id)
+                    pid_changed = (new_pid != old_pid)
+                    if pid_changed and new_pid in df_p["project_id"].astype(str).tolist():
+                        st.error(f"이미 존재하는 project_id 입니다: {new_pid}"); st.stop()
+                    if pid_changed:
+                        df_p.loc[df_p["project_id"].astype(str) == old_pid, "project_id"] = new_pid
+                        df_t.loc[df_t["project_id"].astype(str) == old_pid, "project_id"] = new_pid
+                        df_c.loc[(df_c["entity_type"].astype(object).map(_s).str.lower()=="project") & (df_c["entity_id"].astype(object).map(_s)==old_pid), "entity_id"] = new_pid
+                        df_ct.loc[df_ct["project_id"].astype(str) == old_pid, "project_id"] = new_pid
+                        df_bl.loc[df_bl["project_id"].astype(str) == old_pid, "project_id"] = new_pid
+                        df_cf.loc[df_cf["project_id"].astype(str) == old_pid, "project_id"] = new_pid
+                    df_p.loc[df_p["project_id"].astype(str) == (new_pid if pid_changed else old_pid),
+                             ["project_code","name","owner","sponsor","status","start_date","end_date","contract_amount","updated_at"]] = [
+                        project_code, name, owner, sponsor, status, _safe_date_str(start_date), _safe_date_str(end_date), int(amt_val), _now_iso()
+                    ]
+                    _write_all(df_p, df_t, df_c, df_m, df_ct, df_bl, df_cf, df_hr)
+                    st.success(f"프로젝트가 업데이트되었습니다. (ID: {new_pid})")
+                    st.rerun()
+        # --- 신규 모드 ---
+        else:
+            with st.form(key=k("proj","new_form"), clear_on_submit=True):
+                colA, colB = st.columns(2)
+                with colA:
+                    project_id_in = st.text_input("project_id (문자/숫자 허용, 미입력 시 자동 번호)", value="", key=k("proj","id_new"))
+                    project_code  = st.text_input("Project Code", value="", key=k("proj","code_new"))
+                    name          = st.text_input("사업명", value="", key=k("proj","name_new"))
+                    owner         = st.text_input("Owner", value="", key=k("proj","owner_new"))
+                    sponsor       = st.text_input("Sponsor", value="", key=k("proj","sponsor_new"))
+                with colB:
+                    status        = st.selectbox("Status", options=PROJECT_STATUS_OPTIONS, index=1, key=k("proj","status_new"))
+                    start_date    = st.date_input("Start", value=date.today(), key=k("proj","start_new"))
+                    end_date      = st.date_input("End",   value=date.today(), key=k("proj","end_new"))
+                    amt_in        = st.text_input("계약금액 (KRW, 숫자만)", value="", placeholder="예: 150000000", key=k("proj","amt_new"))
+                submitted = st.form_submit_button("추가(신규)")
+
+                # 날짜 유효성 검사: End >= Start
+                if submitted:
+                    if end_date < start_date:
+                        st.error("⚠️ 종료일(End)은 시작일(Start)보다 이전일 수 없습니다."); st.stop()
+                    if not name.strip():
+                        st.error("사업명은 필수입니다."); st.stop()
+                    amt_val = _parse_int_from_krw_strict(amt_in)
+                    if _s(project_id_in) == "":
+                        new_num, df_m = _next_id(df_m, "project_id_seq")
+                        new_id = str(new_num)
+                    else:
+                        new_id = _s(project_id_in)
+                        if new_id in df_p["project_id"].astype(str).tolist():
+                            st.error(f"이미 존재하는 project_id 입니다: {new_id}"); st.stop()
+                    df_p.loc[len(df_p)] = {
+                        "project_id": new_id, "project_code": project_code, "name": name,
+                        "owner": owner, "sponsor": sponsor, "status": status,
+                        "contract_amount": int(amt_val),
+                        "start_date": _safe_date_str(start_date), "end_date": _safe_date_str(end_date),
+                        "created_at": _now_iso(), "updated_at": _now_iso()
+                    }
+                    _write_all(df_p, df_t, df_c, df_m, df_ct, df_bl, df_cf, df_hr)
+                    st.success(f"프로젝트가 추가되었습니다. ID: {new_id}")
+                    st.rerun()
+
+# ====== [BEGIN] Contracts Tab ======
+def ck(*parts):  # contract-scoped session keys
+    return k("contract", *parts)
+
+def _hash_bytes_contract(b: bytes) -> str:
+    h = hashlib.sha1(); h.update(b); return h.hexdigest()
+
+def _all_bill_Y(pid: str) -> bool:
+    if df_bl.empty: return False
+    d = df_bl[df_bl["project_id"].astype(str) == str(pid)]
+    if d.empty: return False
+    return (d["request"].astype(str).str.upper() == "Y").all()
+
+def _proj_created_yymmdd(pid: str) -> str:
+    row = df_p[df_p["project_id"].astype(str) == str(pid)]
+    if row.empty: return datetime.now().strftime("%y%m%d")
+    created = _s(row.iloc[0].get("created_at",""))
+    if created:
+        try: return parse_dt(created).strftime("%y%m%d")
+        except Exception: pass
+    sdate = _s(row.iloc[0].get("start_date",""))
+    if sdate:
+        try: return parse_dt(sdate).strftime("%y%m%d")
+        except Exception: pass
+    return datetime.now().strftime("%y%m%d")
+
+def _gen_contract_id(pid: str, df_ct: pd.DataFrame) -> str:
+    base = _proj_created_yymmdd(pid)
+    existed = df_ct[df_ct["project_id"].astype(str) == str(pid)]
+    cnt = 0
+    if "contract_id" in existed.columns:
+        for v in existed["contract_id"].astype(str):
+            if isinstance(v, str) and v.startswith(f"AICESS-{base}"):
+                cnt += 1
+    return f"AICESS-{base}{cnt+1:02d}"
+
+with tab_contracts:
+    st.subheader("계약관리")
+
+    if df_p.empty:
+        st.info("먼저 프로젝트를 추가해주세요.")
+    else:
+        # 프로젝트 선택 (사업명 포맷)
+        proj_id = st.selectbox(
+            "프로젝트 선택",
+            options=safe_select_options(df_p["project_id"]),
+            format_func=safe_fmt_by(df_p, "project_id", "name"),
+            key=ck("proj_select")
+        )
+
+        # 계약 헤더 확보 + contract_id 보정
+        if "contract_id" not in df_ct.columns:
+            df_ct["contract_id"] = ""
+        sel = df_ct[df_ct["project_id"].astype(str) == proj_id].copy()
+        if sel.empty:
+            df_ct.loc[len(df_ct)] = {
+                "project_id": proj_id,
+                "contractor": "",
+                "customer": "",
+                "contract_name": f"{safe_fmt_by(df_p,'project_id','name')(proj_id)} 계약",
+                "period_start": _safe_date_str(df_p.loc[df_p["project_id"].astype(str)==proj_id,"start_date"].values[0] if not df_p.empty else date.today()),
+                "period_end":   _safe_date_str(df_p.loc[df_p["project_id"].astype(str)==proj_id,"end_date"].values[0] if not df_p.empty else date.today()),
+                "contract_amount": int(df_p.loc[df_p["project_id"].astype(str)==proj_id,"contract_amount"].values[0]) if not df_p.empty else 0,
+                "contract_status": "작성중",
+                "created_at": _now_iso(), "updated_at": _now_iso(),
+                "contract_id": ""
+            }
+            _write_all(df_p, df_t, df_c, df_m, df_ct, df_bl, df_cf, df_hr)
+            sel = df_ct[df_ct["project_id"].astype(str) == proj_id].copy()
+
+        if _s(sel.iloc[0].get("contract_id","")) == "":
+            new_cid = _gen_contract_id(proj_id, df_ct)
+            df_ct.loc[df_ct["project_id"].astype(str)==proj_id,"contract_id"] = new_cid
+            _write_all(df_p, df_t, df_c, df_m, df_ct, df_bl, df_cf, df_hr)
+            sel = df_ct[df_ct["project_id"].astype(str) == proj_id].copy()
+
+        row = sel.iloc[0].to_dict()
+        proj_amount = int(df_p.loc[df_p["project_id"].astype(str)==proj_id,"contract_amount"].values[0]) if not df_p.empty else 0
+
+        # ── 계약정보
+        st.markdown("### 계약정보")
+        with st.form(key=ck("header_form", proj_id), clear_on_submit=False):
+            c1, c2 = st.columns(2)
+            with c1:
+                st.text_input("계약 ID", value=_s(row.get("contract_id","")), disabled=True, key=ck("cid",proj_id))
+                contractor = st.text_input("계약업체", value=_s(row.get("contractor","")), key=ck("contractor",proj_id))
+                customer   = st.text_input("발주사",   value=_s(row.get("customer","")),   key=ck("customer",proj_id))
+                cname      = st.text_input("계약명",   value=_s(row.get("contract_name","")), key=ck("cname",proj_id))
+            with c2:
+                pstart = st.date_input("계약 시작",
+                    value=(parse_dt(row["period_start"]).date() if _s(row.get("period_start","")) else date.today()),
+                    key=ck("pstart",proj_id))
+                pend   = st.date_input("계약 종료",
+                    value=(parse_dt(row["period_end"]).date() if _s(row.get("period_end","")) else date.today()),
+                    key=ck("pend",proj_id))
+                status = st.selectbox("계약 상태", options=CONTRACT_STATUS_OPTIONS,
+                    index=(CONTRACT_STATUS_OPTIONS.index(_s(row.get("contract_status","작성중"))) if _s(row.get("contract_status","작성중")) in CONTRACT_STATUS_OPTIONS else 0),
+                    key=ck("status",proj_id))
+
+            # 날짜 유효성: 종료 >= 시작
+            if pend < pstart:
+                st.error("⚠️ 계약 종료일은 시작일보다 이전일 수 없습니다. 저장 불가.")
+
+            st.info(f"계약금액(프로젝트에서 관리): **{proj_amount:,} KRW**")
+            if status == "변경":
+                try: header_amt = int(sel["contract_amount"].values[0])
+                except Exception: header_amt = proj_amount
+                if header_amt != proj_amount:
+                    st.warning("계약상태가 변경입니다. 현재 계약정보 금액과 프로젝트 금액이 다릅니다.\n\n프로젝트 탭에서 계약금액을 수정하세요.")
+            submit_header = st.form_submit_button("기본정보 수정")
+
+        if submit_header:
+            if pend < pstart:
+                st.error("계약 종료일이 시작일보다 빠릅니다. 수정 후 저장하세요.")
+            else:
+                _status = st.session_state[ck("status",proj_id)]
+                if _status == "종료" and not _all_bill_Y(proj_id):
+                    st.error("수금계획/실행을 모두 완료(Y)로 변경한 뒤 종료로 저장할 수 있습니다.")
+                else:
+                    df_ct.loc[df_ct["project_id"].astype(str)==proj_id,
+                              ["customer","contract_name","period_start","period_end","updated_at","contract_status","contractor"]] = [
+                        st.session_state[ck("customer",proj_id)],
+                        st.session_state[ck("cname",proj_id)],
+                        _safe_date_str(st.session_state[ck("pstart",proj_id)]),
+                        _safe_date_str(st.session_state[ck("pend",proj_id)]),
+                        _now_iso(),
+                        _status,
+                        st.session_state[ck("contractor",proj_id)],
+                    ]
+                    _write_all(df_p, df_t, df_c, df_m, df_ct, df_bl, df_cf, df_hr)
+                    st.success("계약 기본정보가 저장되었습니다.")
+
+        # ── 수금계획/실행
+        st.markdown("---")
+        st.markdown("### 수금계획/실행")
+        bills = df_bl[df_bl["project_id"].astype(str)==proj_id].copy()
+        if bills.empty:
+            bills = pd.DataFrame(columns=["bill_id","project_id","item","amount","due_date","request","note","created_at","updated_at"])
+        bills["amount"] = pd.to_numeric(bills.get("amount", 0), errors="coerce").fillna(0).astype(int)
+        bills["item"]   = bills.get("item","중도금").fillna("중도금").replace("","중도금").astype(str)
+        bills["request"]= bills.get("request","N").fillna("N").map(lambda x: "Y" if _s(x).upper()=="Y" else "N").astype(str)
+        bills["note"]   = bills.get("note","").fillna("").astype(str)
+        bills["due_date"] = pd.to_datetime(bills.get("due_date", None), errors="coerce").dt.date
+
+        bills_disp = bills[["item","amount","due_date","request","note"]].copy() if not bills.empty \
+                     else pd.DataFrame(columns=["item","amount","due_date","request","note"]).copy()
+
+        if st.button("＋ 항목 추가", key=ck("add_row",proj_id)):
+            bills_disp.loc[len(bills_disp)] = {"item":"중도금","amount":0,"due_date":date.today(),"request":"N","note":""}
+
+        edited_bills = st.data_editor(
+            bills_disp.reset_index(drop=True),
+            width='stretch', height=340, num_rows="dynamic",
+            column_config={
+                "item":     st.column_config.SelectboxColumn("항목", options=BILL_ITEM_OPTIONS, required=True),
+                "amount":   st.column_config.NumberColumn("수금 금액(KRW)", min_value=0, step=1),
+                "due_date": st.column_config.DateColumn("수금 예정일"),
+                "request":  st.column_config.SelectboxColumn("수금 요청 여부", options=YN_OPTIONS),
+                "note":     st.column_config.TextColumn("비고"),
+            },
+            key=ck("editor",proj_id),
+        )
+
+        if st.button("💾 수금계획/실행 저장", key=ck("save_bills",proj_id)):
+            df_bl = df_bl[df_bl["project_id"].astype(str) != proj_id]
+            for _, r in edited_bills.iterrows():
+                item = (_s(r.get("item","")) or "중도금")
+                amt  = int(_parse_int_from_krw_strict(r.get("amount", 0)))
+                due_raw = r.get("due_date","")
+                # 날짜는 None 허용(비워둘 수 있음)
+                if isinstance(due_raw, (datetime, date)):
+                    due = _safe_date_str(due_raw)
+                else:
+                    try: due = _safe_date_str(parse_dt(str(due_raw)).date())
+                    except Exception: due = ""
+                req  = "Y" if _s(r.get("request","N")).upper()=="Y" else "N"
+                note = _s(r.get("note",""))
+                new_id, df_m = _next_id(df_m, "bill_id_seq")
+                df_bl.loc[len(df_bl)] = {
+                    "bill_id": int(new_id),"project_id": proj_id,"item": item,"amount": int(amt),
+                    "due_date": due,"request": req,"note": note,
+                    "created_at": _now_iso(),"updated_at": _now_iso()
+                }
+            _write_all(df_p, df_t, df_c, df_m, df_ct, df_bl, df_cf, df_hr)
+            st.success("수금계획/실행이 저장되었습니다.")
+
+        collected = int(df_bl[(df_bl["project_id"].astype(str)==proj_id) &
+                              (df_bl["request"].astype(str).str.upper()=="Y")]["amount"].sum())
+        balance   = max(int(proj_amount) - collected, 0)
+        st.info(f"잔금: **{balance:,} KRW**  (= 계약금액 {proj_amount:,} - 수금요청(Y) 합 {collected:,})")
+
+        # ── 계약서 업로드/관리: 디스크 저장 + Excel 메타 + 선택 ZIP 다운로드/삭제
+        st.markdown("---")
+        st.markdown("### 계약서 업로드/관리")
+        os.makedirs(os.path.join(UPLOAD_ROOT, str(proj_id)), exist_ok=True)
+
+        up_files = st.file_uploader(
+            "계약서 업로드 (hwp, hwpx, xlsx, docx, pdf)",
+            type=["hwp","hwpx","xlsx","docx","pdf"],
+            accept_multiple_files=True,
+            key=ck("uploader",proj_id)
+        )
+        # 업로드 처리
+        sig = _files_signature(up_files) if up_files else None
+        if sig and st.session_state.get(ck("last_sig")) != sig:
+            added = dup = 0
+            for f in up_files:
+                content = f.getbuffer()
+                h = _hash_bytes_contract(bytes(content))
+                # 중복 체크: 같은 프로젝트, 동일 해시 또는 동일 파일명
+                dup_mask = (df_cf["project_id"].astype(str)==str(proj_id)) & (
+                    (df_cf["file_hash"]==h) | (df_cf["filename"]==_s(f.name))
+                )
+                if dup_mask.any():
+                    dup += 1
+                    continue
+                # 디스크 저장
+                safe_name = _s(f.name)
+                save_path = os.path.join(UPLOAD_ROOT, str(proj_id), safe_name)
+                with open(save_path, "wb") as out:
+                    out.write(content)
+
+                # 메타 기록
+                new_id, df_m = _next_id(df_m, "file_id_seq")
+                df_cf.loc[len(df_cf)] = {
+                    "file_id": int(new_id),
+                    "project_id": str(proj_id),
+                    "filename": safe_name,
+                    "path": save_path,
+                    "note": "",
+                    "uploaded_at": _now_iso(),
+                    "file_hash": h
+                }
+                added += 1
+            st.session_state[ck("last_sig")] = sig
+            if added or dup:
+                _write_all(df_p, df_t, df_c, df_m, df_ct, df_bl, df_cf, df_hr)
+                st.success(f"업로드 처리: 추가 {added} / 중복 {dup}")
+                st.rerun()
+
+        # 현재 파일 목록 표시
+        cur_files = df_cf[df_cf["project_id"].astype(str)==str(proj_id)].copy()
+        cur_files = cur_files.sort_values("uploaded_at", ascending=False).reset_index(drop=True)
+        view = cur_files[["filename","uploaded_at","note"]].copy()
+        view["note"] = view["note"].fillna("").astype(str)
+        view.insert(0, "번호", range(1, len(view)+1))
+        view.insert(0, "선택", False)
+
+        edited_view = st.data_editor(
+            view,
+            width='stretch', height=300, num_rows="fixed", hide_index=True,
+            column_config={
+                "선택": st.column_config.CheckboxColumn("선택", width="small", help="다운로드/삭제할 파일 선택"),
+                "번호":  st.column_config.Column("번호", width="small", disabled=True),
+                "filename": st.column_config.TextColumn("파일명", disabled=True),
+                "uploaded_at": st.column_config.TextColumn("등록일자", disabled=True),
+                "note": st.column_config.TextColumn("비고"),
+            },
+            key=ck("files_table",proj_id)
+        )
+
+        # 비고 저장
+        if st.button("비고 저장", key=ck("save_notes",proj_id)):
+            for _, rv in edited_view.iterrows():
+                fn = _s(rv["filename"]); nt = _s(rv.get("note",""))
+                df_cf.loc[(df_cf["project_id"].astype(str)==str(proj_id)) & (df_cf["filename"]==fn), "note"] = nt
+            _write_all(df_p, df_t, df_c, df_m, df_ct, df_bl, df_cf, df_hr)
+            st.success("비고가 저장되었습니다.")
+
+        sel_mask = edited_view["선택"] == True if "선택" in edited_view.columns else pd.Series([], dtype=bool)
+        sel_names = edited_view.loc[sel_mask, "filename"].astype(str).tolist()
+
+        cdl, cdel = st.columns(2)
+        with cdl:
+            # 선택 ZIP 다운로드
+            if st.button("⬇ 선택 파일 ZIP 다운로드", key=ck("zip_dl_btn",proj_id)):
+                if not sel_names:
+                    st.warning("선택된 파일이 없습니다.")
+                else:
+                    # 선택된 파일 경로 수집
+                    paths = df_cf[(df_cf["project_id"].astype(str)==str(proj_id)) & (df_cf["filename"].astype(str).isin(sel_names))]["path"].astype(str).tolist()
+                    if not paths:
+                        st.warning("다운로드할 파일을 찾지 못했습니다.")
+                    else:
+                        mem = io.BytesIO()
+                        with zipfile.ZipFile(mem, "w", zipfile.ZIP_DEFLATED) as zf:
+                            for p in paths:
+                                if os.path.isfile(p):
+                                    zf.write(p, arcname=os.path.basename(p))
+                        mem.seek(0)
+                        st.download_button(
+                            label=f"ZIP 다운로드 ({len(paths)}개)",
+                            data=mem,
+                            file_name=f"{proj_id}_contracts_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip",
+                            mime="application/zip",
+                            key=ck("zip_download",proj_id)
+                        )
+        with cdel:
+            # 선택 파일 삭제
+            if st.button("🗑 선택 파일 삭제", key=ck("delete_btn",proj_id)):
+                if not sel_names:
+                    st.warning("선택된 파일이 없습니다.")
+                else:
+                    st.session_state[ck("ask_del",proj_id)] = True
+
+        if st.session_state.get(ck("ask_del",proj_id), False):
+            st.warning(f"선택된 {len(sel_names)}개 파일을 삭제하시겠습니까?")
+            cA, cB = st.columns(2)
+            with cA:
+                if st.button("✅ 예, 삭제", key=ck("do_del",proj_id)):
+                    # 메타/디스크 동시에 삭제
+                    rows = df_cf[(df_cf["project_id"].astype(str)==str(proj_id)) &
+                                 (df_cf["filename"].astype(str).isin(sel_names))]
+                    for _, r in rows.iterrows():
+                        pth = _s(r.get("path",""))
+                        if pth and os.path.isfile(pth):
+                            try: os.remove(pth)
+                            except: pass
+                    df_cf = df_cf[~((df_cf["project_id"].astype(str)==str(proj_id)) &
+                                    (df_cf["filename"].astype(str).isin(sel_names)))]
+                    _write_all(df_p, df_t, df_c, df_m, df_ct, df_bl, df_cf, df_hr)
+                    st.session_state[ck("ask_del",proj_id)] = False
+                    st.success("삭제 완료")
+                    st.rerun()
+            with cB:
+                if st.button("취소", key=ck("cancel_del",proj_id)):
+                    st.session_state[ck("ask_del",proj_id)] = False
+                    st.info("삭제를 취소했습니다.")
+
+# ====== [END] Contracts Tab ======
+
+
+
+
+
+
+
+
+
+
+
+# ====== [BEGIN] Human Resources Tab (Instant Recalc + Revised Formulas) ======
+def hk(*parts):  # HR-scoped session keys
+    return k("hr", *parts)
+
+WORKING_DAYS_PER_MM = 20  # MM 계산 기준 업무일(가정)
+
+def _calc_hr_row(r: dict) -> dict:
+    """입력값 기반 파생 필드 계산 + 검증 메시지."""
+    sd = _parse_date_maybe(r.get("start_date", ""))
+    ed = _parse_date_maybe(r.get("end_date", ""))
+    alloc = float(pd.to_numeric(r.get("allocation_rate", 0), errors="coerce") or 0.0)
+    actual_md = float(pd.to_numeric(r.get("actual_md", 0), errors="coerce") or 0.0)
+    cost_unit = float(pd.to_numeric(r.get("cost_unit", 0), errors="coerce") or 0.0)
+
+    err = None
+    # 이름: 한글/영문/공백만 허용
+    name = _s(r.get("member_name", ""))
+    if name and not re.fullmatch(r"[A-Za-z가-힣\s]+", name):
+        err = "성명은 문자만 가능합니다."
+    # 날짜: 종료 < 시작 방지
+    if sd and ed and ed < sd:
+        err = "종료일은 시작일보다 빠를 수 없습니다."
+
+    # 계획공수(MM) = (업무일 × 투입률% / 100) / 20
+    workdays = business_days_inclusive(sd, ed) if (sd and ed) else 0
+    planned_md = (workdays * (alloc / 100.0)) / WORKING_DAYS_PER_MM if (workdays > 0 and alloc > 0) else 0.0
+
+    # ✅ 수식 변경: 비용은 단가×공수
+    planned_cost = cost_unit * planned_md
+    actual_cost  = cost_unit * actual_md
+
+    r["planned_md"]   = float(round(planned_md, 4))
+    r["planned_cost"] = float(round(planned_cost, 0))  # KRW 정수표현
+    r["actual_cost"]  = float(round(actual_cost, 0))
+    r["diff_md"]      = float(round(planned_md - actual_md, 4))
+    r["diff_cost"]    = float(round(planned_cost - actual_cost, 0))
+    r["error"]        = err
+    return r
+
+def _recalc_df(df: pd.DataFrame) -> pd.DataFrame:
+    """테이블 전행을 즉시 재계산."""
+    if df is None or df.empty:
+        return df
+    # 날짜열은 편집 중일 수 있어 안전 변환
+    tmp = df.copy()
+    # editor가 반환한 datetime/str 혼재 허용
+    for c in ["start_date","end_date"]:
+        if c in tmp.columns:
+            # 계산은 date/str 모두 _calc_hr_row에서 처리
+            pass
+    cols = [
+        "planned_md","planned_cost","actual_cost","diff_md","diff_cost","error"
+    ]
+    out = tmp.apply(lambda r: pd.Series(_calc_hr_row(r.to_dict())), axis=1)
+    # 기존 컬럼 보존 + 파생 덮어쓰기
+    for c in cols:
+        tmp[c] = out[c]
+    return tmp
+
+def _hr_defaults(project_id: str, project_name: str) -> dict:
+    return {
+        "no": "",
+        "project_id": project_id,
+        "project_name": project_name,
+        "member_name": "",
+        "department_role": "",
+        "position_skill": "",
+        "start_date": date.today(),
+        "end_date": date.today(),
+        "allocation_rate": 0.0,
+        "planned_md": 0.0,
+        "actual_md": 0.0,
+        "cost_unit": 0.0,
+        "planned_cost": 0.0,
+        "actual_cost": 0.0,
+        "role": "",
+        "main_task": "",
+        "diff_md": 0.0,
+        "diff_cost": 0.0,
+        "remark": ""
+    }
+
+with tab_hr:
+    st.subheader("인력관리 (투입 계획/실행)")
+    if df_p.empty:
+        st.info("먼저 프로젝트를 추가해주세요.")
+    else:
+        # 프로젝트 선택 (Contracts와 동일 포맷)
+        proj_id = st.selectbox(
+            "프로젝트 선택",
+            options=safe_select_options(df_p["project_id"]),
+            format_func=safe_fmt_by(df_p, "project_id", "name"),
+            key=hk("proj_select")
+        )
+        proj_name_fmt = safe_fmt_by(df_p, "project_id", "name")(proj_id)
+
+        # 세션 테이블 준비
+        disp_cols = [
+            "선택","no","project_name","member_name","department_role","position_skill",
+            "start_date","end_date","allocation_rate","planned_md","actual_md","cost_unit",
+            "planned_cost","actual_cost","role","main_task","diff_md","diff_cost","remark"
+        ]
+        sess_key = hk("table", proj_id)
+        if sess_key not in st.session_state:
+            base = df_hr[df_hr["project_id"].astype(str) == proj_id].copy().reset_index(drop=True)
+            if "no" not in base.columns or base["no"].isna().all() or (base["no"] == "").all():
+                base["no"] = (base.index + 1).astype(int).astype(str)
+            base["project_name"] = proj_name_fmt
+            if not base.empty:
+                base = _recalc_df(base)  # 초기 로드 시점 재계산
+            base.insert(0, "선택", False)
+            st.session_state[sess_key] = base[disp_cols] if not base.empty else pd.DataFrame(columns=disp_cols)
+
+        # ── 표 상단: 추가 버튼
+        top_left, _sp = st.columns([0.25, 0.75])
+        with top_left:
+            if st.button("＋ 투입인력 추가", key=hk("add", proj_id)):
+                t = st.session_state[sess_key].copy()
+                new_row = _calc_hr_row(_hr_defaults(proj_id, proj_name_fmt))
+                row = {
+                    "선택": False,
+                    "no": str(len(t) + 1),
+                    "project_name": proj_name_fmt,
+                    "member_name": "",
+                    "department_role": "",
+                    "position_skill": "",
+                    "start_date": date.today(),
+                    "end_date": date.today(),
+                    "allocation_rate": 0.0,
+                    "planned_md": new_row["planned_md"],
+                    "actual_md": 0.0,
+                    "cost_unit": 0.0,
+                    "planned_cost": 0.0,
+                    "actual_cost": 0.0,
+                    "role": "",
+                    "main_task": "",
+                    "diff_md": 0.0,
+                    "diff_cost": 0.0,
+                    "remark": "",
+                }
+                st.session_state[sess_key] = pd.concat([t, pd.DataFrame([row])], ignore_index=True)
+
+        # ── (핵심) 에디터 렌더 전, 항상 즉시 재계산
+        current = _recalc_df(st.session_state[sess_key])
+
+        # ── 에디터에 넘기기 전 Date dtype 보정(DateColumn 호환)
+        t_for_edit = current.copy()
+        for cdate in ["start_date","end_date"]:
+            if cdate in t_for_edit.columns:
+                t_for_edit[cdate] = pd.to_datetime(t_for_edit[cdate], errors="coerce")
+
+        # ── 에디터 본체
+        column_config = {
+            "선택": st.column_config.CheckboxColumn("선택", width="small", help="삭제/수정 대상 선택"),
+            "no": st.column_config.Column("no.", width="small", disabled=True),
+            "project_name": st.column_config.TextColumn("프로젝트명", disabled=True),
+            "member_name": st.column_config.TextColumn("성명", help="영문/한글/공백만 허용"),
+            "department_role": st.column_config.TextColumn("소속/직무", help="최대 10자"),
+            "position_skill": st.column_config.TextColumn("직급/스킬", help="최대 10자"),
+            "start_date": st.column_config.DateColumn("투입시작일"),
+            "end_date": st.column_config.DateColumn("투입종료일"),
+            "allocation_rate": st.column_config.NumberColumn("투입률(%)", min_value=0.0, max_value=100.0, step=1.0),
+            "planned_md": st.column_config.NumberColumn("계획공수(MM)", disabled=True),
+            "actual_md": st.column_config.NumberColumn("실제 투입공수(MM)", min_value=0.0, step=0.1),
+            "cost_unit": st.column_config.NumberColumn("인건비(KRW)", min_value=0.0, step=1.0),
+            "planned_cost": st.column_config.NumberColumn("계획인건비(KRW)", disabled=True),
+            "actual_cost": st.column_config.NumberColumn("실제인건비(KRW)", disabled=True),
+            "role": st.column_config.SelectboxColumn("역할", options=["","PM","PL","개발","기획","QA"]),
+            "main_task": st.column_config.TextColumn("주요업무", help="최대 50자"),
+            "diff_md": st.column_config.NumberColumn("계획 대비 실제 공수", disabled=True),
+            "diff_cost": st.column_config.NumberColumn("계획 대비 실제 비용", disabled=True),
+            "remark": st.column_config.TextColumn("비고", help="최대 100자"),
+        }
+        edited = st.data_editor(
+            t_for_edit,
+            column_config=column_config,
+            width='stretch', height=420, num_rows="dynamic",
+            hide_index=True,
+            key=hk("editor", proj_id)
+        )
+
+        # ── 에디터 반환 즉시 재계산(다음 렌더에서 즉시 반영되도록 세션에 저장)
+        st.session_state[sess_key] = _recalc_df(edited)
+
+        # ── 합계(이미 재계산된 edited 사용)
+        try:
+            _sum_planned_md = float(pd.to_numeric(edited.get("planned_md", []), errors="coerce").fillna(0).sum())
+            _sum_actual_md  = float(pd.to_numeric(edited.get("actual_md", []),  errors="coerce").fillna(0).sum())
+            _sum_planned_c  = float(pd.to_numeric(edited.get("planned_cost", []), errors="coerce").fillna(0).sum())
+            _sum_actual_c   = float(pd.to_numeric(edited.get("actual_cost", []),  errors="coerce").fillna(0).sum())
+            _sum_diff_md    = float(pd.to_numeric(edited.get("diff_md", []),      errors="coerce").fillna(0).sum())
+            _sum_diff_cost  = float(pd.to_numeric(edited.get("diff_cost", []),    errors="coerce").fillna(0).sum())
+            _cnt_members    = int(len(edited))
+        except Exception:
+            _sum_planned_md = _sum_actual_md = _sum_planned_c = _sum_actual_c = _sum_diff_md = _sum_diff_cost = 0.0
+            _cnt_members = 0
+
+        st.markdown("---")
+        m1, m2, m3, m4, m5, m6, m7 = st.columns(7)
+        m1.metric("인원 수", _cnt_members)
+        m2.metric("계획공수(MM) 합", f"{_sum_planned_md:,.2f}")
+        m3.metric("실제공수(MM) 합", f"{_sum_actual_md:,.2f}")
+        m4.metric("계획인건비 합", f"{_sum_planned_c:,.0f} KRW")
+        m5.metric("실제인건비 합", f"{_sum_actual_c:,.0f} KRW")
+        m6.metric("공수 차이 합", f"{_sum_diff_md:,.2f}")
+        m7.metric("비용 차이 합", f"{_sum_diff_cost:,.0f} KRW")
+
+        # ── 표 하단: 좌측 삭제 / 가운데 수정 / 우측 저장
+        st.markdown("---")
+        bottom_l, bottom_m, bottom_r = st.columns([0.25, 0.25, 0.5])
+
+        # 삭제(하단, 좌측)
+        with bottom_l:
+            if st.button("🗑 선택 삭제", key=hk("del_bottom", proj_id)):
+                t = st.session_state[sess_key].copy()
+                sel_mask = (t["선택"] == True) if "선택" in t.columns else pd.Series([], dtype=bool)
+                if "선택" not in t.columns or not sel_mask.any():
+                    st.warning("선택된 목록이 없습니다.")
+                else:
+                    t = t[~sel_mask].copy().reset_index(drop=True)
+                    t["no"] = (t.index + 1).astype(int).astype(str)
+                    st.session_state[sess_key] = _recalc_df(t)
+                    st.success("선택한 인력을 삭제했습니다.")
+                    st.rerun()
+
+        # 수정(하단, 중간) — 선택 1건 폼 열기
+        with bottom_m:
+            if st.button("✏️ 선택 수정", key=hk("edit_bottom", proj_id)):
+                t = st.session_state[sess_key].copy()
+                sel = t[t["선택"] == True]
+                if sel.empty:
+                    st.warning("수정할 대상을 선택하세요.")
+                elif len(sel) > 1:
+                    st.warning("한 번에 한 명만 수정할 수 있습니다. 1명만 선택하세요.")
+                else:
+                    st.session_state[hk("edit_target_no", proj_id)] = _s(sel.iloc[0]["no"])
+                    st.session_state[hk("show_edit_form", proj_id)] = True
+                    st.session_state[hk("do_scroll_form", proj_id)] = True
+                    st.rerun()
+
+        # 저장(하단, 우측)
+        with bottom_r:
+            if st.button("💾 표 저장", key=hk("save_table", proj_id)):
+                # 세션(이미 재계산됨) → 엑셀 저장
+                tmp = st.session_state[sess_key].copy()
+                if "선택" in tmp.columns:
+                    tmp = tmp.drop(columns=["선택"])
+                # 날짜 문자열화
+                for cdate in ["start_date","end_date"]:
+                    if cdate in tmp.columns:
+                        tmp[cdate] = tmp[cdate].apply(_safe_date_str)
+
+                # no 정렬/재부여
+                try:
+                    tmp["no_int"] = pd.to_numeric(tmp["no"], errors="coerce").fillna(0).astype(int)
+                    tmp = tmp.sort_values("no_int").drop(columns=["no_int"])
+                except Exception:
+                    pass
+                tmp["no"] = (range(1, len(tmp) + 1))
+                tmp["no"] = tmp["no"].astype(int).astype(str)
+
+                df_hr = df_hr[df_hr["project_id"].astype(str) != proj_id]
+                for _, rr in tmp.iterrows():
+                    df_hr.loc[len(df_hr)] = {
+                        "no": _s(rr.get("no","")),
+                        "project_id": proj_id,
+                        "project_name": proj_name_fmt,
+                        "member_name": _s(rr.get("member_name","")),
+                        "department_role": _s(rr.get("department_role","")),
+                        "position_skill": _s(rr.get("position_skill","")),
+                        "start_date": _safe_date_str(rr.get("start_date","")),
+                        "end_date": _safe_date_str(rr.get("end_date","")),
+                        "allocation_rate": float(pd.to_numeric(rr.get("allocation_rate",0), errors="coerce") or 0.0),
+                        "planned_md": float(pd.to_numeric(rr.get("planned_md",0), errors="coerce") or 0.0),
+                        "actual_md": float(pd.to_numeric(rr.get("actual_md",0), errors="coerce") or 0.0),
+                        "cost_unit": float(pd.to_numeric(rr.get("cost_unit",0), errors="coerce") or 0.0),
+                        "planned_cost": float(pd.to_numeric(rr.get("planned_cost",0), errors="coerce") or 0.0),
+                        "actual_cost": float(pd.to_numeric(rr.get("actual_cost",0), errors="coerce") or 0.0),
+                        "role": _s(rr.get("role","")),
+                        "main_task": _s(rr.get("main_task","")),
+                        "diff_md": float(pd.to_numeric(rr.get("diff_md",0), errors="coerce") or 0.0),
+                        "diff_cost": float(pd.to_numeric(rr.get("diff_cost",0), errors="coerce") or 0.0),
+                        "remark": _s(rr.get("remark","")),
+                    }
+                _write_all(df_p, df_t, df_c, df_m, df_ct, df_bl, df_cf, df_hr)
+                st.success("인력 투입 계획/실행 — 표 저장 완료")
+                st.rerun()
+
+        # ===== 편집 폼 (선택 수정) =====
+        if st.session_state.get(hk("show_edit_form", proj_id), False):
+            st.markdown("---")
+            st.markdown("<div id='hr_edit_form'></div>", unsafe_allow_html=True)
+            if st.session_state.get(hk("do_scroll_form", proj_id), False):
+                scroll_to("hr_edit_form")
+                st.session_state[hk("do_scroll_form", proj_id)] = False
+
+            target_no = st.session_state.get(hk("edit_target_no", proj_id), "")
+            t = st.session_state[sess_key].copy()
+            cur = t[t["no"].astype(str) == str(target_no)]
+            if cur.empty:
+                st.warning("선택한 행을 찾을 수 없습니다.")
+            else:
+                row = cur.iloc[0].to_dict()
+                st.markdown(f"### 선택 수정 — no. {target_no}")
+                if st.button("닫기", key=hk("edit_close", proj_id)):
+                    st.session_state[hk("show_edit_form", proj_id)] = False
+                    st.rerun()
+
+                with st.form(key=hk("edit_form", proj_id), clear_on_submit=False):
+                    c1, c2 = st.columns(2)
+
+                    with c1:
+                        member_name = st.text_input("성명", value=_s(row.get("member_name","")))
+                        department_role = st.text_input("소속/직무", value=_s(row.get("department_role",""))[:10])
+                        position_skill  = st.text_input("직급/스킬", value=_s(row.get("position_skill",""))[:10])
+                        role_sel = st.selectbox("역할", options=["","PM","PL","개발","기획","QA"],
+                                                index=(["","PM","PL","개발","기획","QA"].index(_s(row.get("role",""))) if _s(row.get("role","")) in ["","PM","PL","개발","기획","QA"] else 0))
+
+                    with c2:
+                        sd = _parse_date_maybe(row.get("start_date","")) or date.today()
+                        ed = _parse_date_maybe(row.get("end_date","")) or date.today()
+                        start_date_in = st.date_input("투입시작일", value=sd)
+                        end_date_in   = st.date_input("투입종료일", value=ed)
+                        alloc_in      = st.number_input("투입률(%)", min_value=0.0, max_value=100.0, step=1.0,
+                                                        value=float(pd.to_numeric(row.get("allocation_rate",0), errors="coerce") or 0.0))
+                        actual_md_in  = st.number_input("실제 투입공수(MM)", min_value=0.0, step=0.1,
+                                                        value=float(pd.to_numeric(row.get("actual_md",0), errors="coerce") or 0.0))
+                        cost_unit_in  = st.number_input("인건비(KRW)", min_value=0.0, step=1.0,
+                                                        value=float(pd.to_numeric(row.get("cost_unit",0), errors="coerce") or 0.0))
+
+                    main_task = st.text_input("주요업무", value=_s(row.get("main_task",""))[:50])
+                    remark_in = st.text_input("비고", value=_s(row.get("remark",""))[:100])
+
+                    submit_edit = st.form_submit_button("저장(수정)")
+
+                if submit_edit:
+                    # 입력값 -> 파생 즉시 계산
+                    rec = {
+                        "no": _s(target_no),
+                        "project_id": proj_id,
+                        "project_name": proj_name_fmt,
+                        "member_name": _s(member_name)[:50],
+                        "department_role": _s(department_role)[:10],
+                        "position_skill": _s(position_skill)[:10],
+                        "start_date": _safe_date_str(start_date_in),
+                        "end_date": _safe_date_str(end_date_in),
+                        "allocation_rate": float(alloc_in),
+                        "actual_md": float(actual_md_in),
+                        "cost_unit": float(cost_unit_in),
+                        "role": _s(role_sel),
+                        "main_task": _s(main_task)[:50],
+                        "remark": _s(remark_in)[:100],
+                    }
+                    rec = _calc_hr_row(rec)
+                    if rec["error"]:
+                        st.error(f"저장 실패: {rec['error']}")
+                        st.stop()
+
+                    # 세션 테이블 반영(이 시점에 즉시 재계산된 값으로 반영)
+                    idx = t[t["no"].astype(str) == str(target_no)].index[0]
+                    for kcol, v in {
+                        "project_name": proj_name_fmt,
+                        "member_name": rec["member_name"],
+                        "department_role": rec["department_role"],
+                        "position_skill": rec["position_skill"],
+                        "start_date": rec["start_date"],
+                        "end_date": rec["end_date"],
+                        "allocation_rate": rec["allocation_rate"],
+                        "planned_md": rec["planned_md"],
+                        "actual_md": rec["actual_md"],
+                        "cost_unit": rec["cost_unit"],
+                        "planned_cost": rec["planned_cost"],
+                        "actual_cost": rec["actual_cost"],
+                        "role": rec["role"],
+                        "main_task": rec["main_task"],
+                        "diff_md": rec["diff_md"],
+                        "diff_cost": rec["diff_cost"],
+                        "remark": rec["remark"],
+                    }.items():
+                        t.at[idx, kcol] = v
+                    st.session_state[sess_key] = t
+
+                    # 엑셀 반영(해당 프로젝트 전체 재저장 방식)
+                    tmp = _recalc_df(st.session_state[sess_key].copy())
+                    if "선택" in tmp.columns:
+                        tmp = tmp.drop(columns=["선택"])
+                    for cdate in ["start_date","end_date"]:
+                        if cdate in tmp.columns:
+                            tmp[cdate] = tmp[cdate].apply(_safe_date_str)
+
+                    # no 정렬/재부여
+                    try:
+                        tmp["no_int"] = pd.to_numeric(tmp["no"], errors="coerce").fillna(0).astype(int)
+                        tmp = tmp.sort_values("no_int").drop(columns=["no_int"])
+                    except Exception:
+                        pass
+                    tmp["no"] = (range(1, len(tmp) + 1))
+                    tmp["no"] = tmp["no"].astype(int).astype(str)
+
+                    df_hr = df_hr[df_hr["project_id"].astype(str) != proj_id]
+                    for _, rr in tmp.iterrows():
+                        df_hr.loc[len(df_hr)] = {
+                            "no": _s(rr.get("no","")),
+                            "project_id": proj_id,
+                            "project_name": proj_name_fmt,
+                            "member_name": _s(rr.get("member_name","")),
+                            "department_role": _s(rr.get("department_role","")),
+                            "position_skill": _s(rr.get("position_skill","")),
+                            "start_date": _safe_date_str(rr.get("start_date","")),
+                            "end_date": _safe_date_str(rr.get("end_date","")),
+                            "allocation_rate": float(pd.to_numeric(rr.get("allocation_rate",0), errors="coerce") or 0.0),
+                            "planned_md": float(pd.to_numeric(rr.get("planned_md",0), errors="coerce") or 0.0),
+                            "actual_md": float(pd.to_numeric(rr.get("actual_md",0), errors="coerce") or 0.0),
+                            "cost_unit": float(pd.to_numeric(rr.get("cost_unit",0), errors="coerce") or 0.0),
+                            "planned_cost": float(pd.to_numeric(rr.get("planned_cost",0), errors="coerce") or 0.0),
+                            "actual_cost": float(pd.to_numeric(rr.get("actual_cost",0), errors="coerce") or 0.0),
+                            "role": _s(rr.get("role","")),
+                            "main_task": _s(rr.get("main_task","")),
+                            "diff_md": float(pd.to_numeric(rr.get("diff_md",0), errors="coerce") or 0.0),
+                            "diff_cost": float(pd.to_numeric(rr.get("diff_cost",0), errors="coerce") or 0.0),
+                            "remark": _s(rr.get("remark","")),
+                        }
+                    _write_all(df_p, df_t, df_c, df_m, df_ct, df_bl, df_cf, df_hr)
+                    st.success("선택 항목이 수정 저장되었습니다.")
+                    st.session_state[hk("show_edit_form", proj_id)] = False
+                    st.rerun()
+# ====== [END] Human Resources Tab (Instant Recalc + Revised Formulas) ======
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# ───────── Tasks ─────────
+with tab_tasks:
+    st.subheader("작업 목록")
+    if df_p.empty:
+        st.info("먼저 프로젝트를 추가해주세요.")
+    else:
+        # 상태키 초기화
+        st.session_state.setdefault(k("task","show_form"), False)
+        st.session_state.setdefault(k("task","do_scroll"), False)
+
+        project_choice = st.selectbox(
+            "프로젝트 선택",
+            options=safe_select_options(df_p["project_id"]),
+            format_func=safe_fmt_by(df_p, "project_id", "name"),
+            key=k("task","proj_choice")
+        )
+
+        # --- [ADD] 해당 프로젝트의 HR 인력명 목록 추출 ---
+        hr_names = (
+            df_hr.loc[df_hr["project_id"].astype(str) == project_choice, "member_name"]
+            .dropna()
+            .astype(str)
+            .map(_s).map(str.strip)
+            .replace("", np.nan).dropna()
+            .unique().tolist()
+        )
+        hr_names = sorted(hr_names)
+        # -----------------------------------------------
+
+        b1, b2, _sp = st.columns([0.22,0.22,0.56], gap="small")
+        with b1:
+            if st.button("➕ 작업 추가/수정", key=k("task","open_form_btn")):
+                st.session_state[k("task","show_form")] = True
+                st.session_state[k("task","do_scroll")] = True
+                st.rerun()
+        with b2:
+            if st.button("🗑 선택 삭제", key=k("task","bulk_delete_btn")):
+                st.session_state[k("task","trigger_delete")] = True
+
+        st.divider()
+        st.markdown("### 선택 프로젝트의 작업표")
+
+        tshow = df_t[df_t["project_id"].astype(str) == project_choice].copy()
+        status_icon_map = {"Done":"🟢","In Progress":"🔵","Blocked":"🔴","To Do":"⚪"}
+
+        if not tshow.empty:
+            tshow.insert(0, "No", range(1, len(tshow)+1))
+            tshow.insert(0, "선택", False)
+            tshow["상태(색)"] = tshow["status"].map(status_icon_map).fillna("🟠")
+            tshow = tshow.dropna(axis=1, how="all")
+            base_cols = ["project_id","task_id","title","assignee","priority","status","상태(색)","progress","start_date","due_date","estimate_days","labels","description"]
+            ordered = ["선택","No"] + [c for c in base_cols if c in tshow.columns] + [c for c in tshow.columns if c not in (["선택","No"] + base_cols)]
+
+            edited = st.data_editor(
+                tshow[ordered],
+                column_config={
+                    "선택":     st.column_config.CheckboxColumn("선택", width="small"),
+                    "progress": st.column_config.NumberColumn("진행률(%)", min_value=0, max_value=100, step=1, help="읽기표시(폼에서 편집)"),
+                    "상태(색)": st.column_config.TextColumn("상태(색상)", disabled=True),
+                },
+                disabled=[c for c in ordered if c not in ["선택"]],
+                width='stretch', height=420, hide_index=True,
+                key=k("task","editor","list",project_choice)
+            )
+            selected_tids = edited.loc[edited["선택"] == True, "task_id"].astype(str).tolist() if "task_id" in edited.columns else []
+        else:
+            st.info("표시할 작업이 없습니다.")
+            selected_tids = []
+
+        if st.session_state.get(k("task","trigger_delete"), False):
+            st.session_state[k("task","trigger_delete")] = False
+            if not selected_tids:
+                st.warning("선택된 작업이 없습니다.")
+            else:
+                st.session_state[k("task","pending_delete_tids")] = selected_tids
+                st.session_state[k("task","show_confirm")] = True
+                st.rerun()
+
+        if st.session_state.get(k("task","show_confirm"), False):
+            pending = st.session_state.get(k("task","pending_delete_tids"), [])
+            st.warning(f"선택한 {len(pending)}개 작업을 삭제하고 task_id를 전체 재채번합니다. 진행하시겠습니까?")
+            cA, cB = st.columns([1,1])
+            with cA:
+                if st.button("✅ 예, 삭제합니다", key=k("task","bulk_delete_yes")):
+                    tids = [str(x) for x in pending]
+                    df_t = df_t[~df_t["task_id"].astype(str).isin(tids)]
+                    df_c = df_c[~((df_c["entity_type"].astype(object).map(_s).str.lower()=="task") & (df_c["entity_id"].astype(object).map(_s).isin(tids)))]
+                    df_t, df_c = _renumber_project_tasks(df_t, df_c, project_choice)
+                    _write_all(df_p, df_t, df_c, df_m, df_ct, df_bl, df_cf, df_hr)
+                    st.session_state[k("task","pending_delete_tids")] = []
+                    st.session_state[k("task","show_confirm")] = False
+                    st.success("작업 삭제 및 재채번 완료")
+                    st.rerun()
+            with cB:
+                if st.button("취소", key=k("task","bulk_delete_cancel")):
+                    st.session_state[k("task","show_confirm")] = False
+                    st.info("삭제가 취소되었습니다.")
+                    st.rerun()
+
+        st.divider()
+        show_form = st.session_state.get(k("task","show_form"), False)
+        if show_form:
+            st.markdown("<div id='taskform'></div>", unsafe_allow_html=True)
+            if st.session_state.get(k("task","do_scroll"), False):
+                scroll_to("taskform")
+                st.session_state[k("task","do_scroll")] = False
+
+            st.markdown("### 작업 추가/수정")
+            if st.button("닫기", key=k("task","close_form")):
+                st.session_state[k("task","show_form")] = False
+                st.rerun()
+
+            edit_task_mode = st.toggle("작업 수정 모드", value=False, key=k("task","edit_mode"))
+            project_tasks = df_t[df_t["project_id"].astype(str) == project_choice].copy()
+
+            selected_task_id = None
+            if edit_task_mode and not project_tasks.empty:
+                # 안전 포맷
+                selected_task_id = st.selectbox(
+                    "수정할 작업",
+                    options=safe_select_options(project_tasks["task_id"]),
+                    format_func=safe_fmt_by(project_tasks, "task_id", "title"),
+                    key=k("task","select_edit",project_choice)
+                )
+
+            title_key       = k("task","title")
+            desc_key        = k("task","desc")
+            assignee_key    = k("task","assignee")
+            priority_key    = k("task","priority")
+            status_key      = k("task","status")
+            progress_key    = k("task","progress")
+            prev_status_key = k("task","prev_status")
+            start_key       = k("task","start")
+            due_key         = k("task","due")
+            est_key         = k("task","estimate_workdays", project_choice)
+            prev_sel_key    = k("task","prev_selected")
+
+            if edit_task_mode and selected_task_id:
+                last_selected = st.session_state.get(prev_sel_key)
+                if (last_selected != selected_task_id):
+                    row = project_tasks[project_tasks["task_id"].astype(str) == selected_task_id].iloc[0].to_dict()
+                    st.session_state[title_key]    = _s(row.get("title",""))
+                    st.session_state[desc_key]     = _s(row.get("description",""))
+                    st.session_state[assignee_key] = _s(row.get("assignee",""))
+                    pr = _s(row.get("priority","Medium"))
+                    st.session_state[priority_key] = pr if pr in TASK_PRIORITY_OPTIONS else "Medium"
+                    cur_status = _s(row.get("status","To Do"))
+                    if cur_status not in TASK_STATUS_OPTIONS: cur_status = "To Do"
+                    st.session_state[status_key]   = cur_status
+                    st.session_state[prev_status_key] = cur_status
+                    try:
+                        st.session_state[progress_key] = int(pd.to_numeric(row.get("progress", 0), errors="coerce"))
+                    except Exception:
+                        st.session_state[progress_key] = 0
+                    sd = _safe_date_str(row.get("start_date",""))
+                    dd = _safe_date_str(row.get("due_date",""))
+                    st.session_state[start_key] = parse_dt(sd).date() if sd else date.today()
+                    st.session_state[due_key]   = parse_dt(dd).date() if dd else date.today()
+                    try:
+                        est_val = float(pd.to_numeric(row.get("estimate_days", np.nan), errors="coerce"))
+                    except Exception:
+                        est_val = np.nan
+                    if pd.isna(est_val):
+                        est_val = float(business_days_inclusive(st.session_state[start_key], st.session_state[due_key]))
+                    st.session_state[est_key] = float(est_val)
+                    st.session_state[prev_sel_key] = selected_task_id
+
+            if not edit_task_mode and st.session_state.get(prev_sel_key) is not None:
+                st.session_state.pop(prev_sel_key, None)
+            if not edit_task_mode:
+                st.session_state.setdefault(title_key, "")
+                st.session_state.setdefault(desc_key, "")
+                st.session_state.setdefault(assignee_key, "")
+                st.session_state.setdefault(priority_key, "Medium")
+                st.session_state.setdefault(status_key, "To Do")
+                st.session_state.setdefault(prev_status_key, "To Do")
+                st.session_state.setdefault(progress_key, 0)
+                st.session_state.setdefault(start_key, date.today())
+                st.session_state.setdefault(due_key, date.today())
+                st.session_state[est_key] = float(business_days_inclusive(st.session_state[start_key], st.session_state[due_key]))
+
+            def _on_status_change():
+                cur = st.session_state[status_key]
+                prev = st.session_state.get(prev_status_key, cur)
+                if cur == "Done":
+                    st.session_state[progress_key] = 100
+                elif prev == "Done" and cur != "Done":
+                    st.session_state[progress_key] = 0
+                st.session_state[prev_status_key] = cur
+
+            def _on_progress_change():
+                try: p = int(st.session_state[progress_key])
+                except Exception: p = 0
+                p = max(0, min(100, p))
+                st.session_state[progress_key] = p
+                if p == 100:
+                    st.session_state[status_key] = "Done"
+
+            title       = st.text_input("Title", value=st.session_state.get(title_key, ""), key=title_key)
+            description = st.text_area("Description", height=120, value=st.session_state.get(desc_key, ""), key=desc_key)
+
+
+
+
+            
+            #assignee    = st.text_input("Assignee", value=st.session_state.get(assignee_key, ""), key=assignee_key)
+
+            # --- [REPLACE] Assignee: HR 명단 기반 선택/임시 입력 ---
+            prev_assignee = _s(st.session_state.get(assignee_key, ""))
+
+            if hr_names:
+                # 기존 값이 명단에 없으면 보존 선택지로 포함
+                options = hr_names.copy()
+                if prev_assignee and prev_assignee not in options:
+                    options = [prev_assignee] + [n for n in options if n != prev_assignee]
+
+                try:
+                    idx = options.index(prev_assignee) if prev_assignee else 0
+                except ValueError:
+                    idx = 0
+
+                st.selectbox(
+                    "Assignee",
+                    options=options,
+                    index=idx if options else 0,
+                    key=assignee_key,
+                    help="인력관리 탭에 등록된 성명에서 선택하세요."
+                )
+            else:
+                st.info("이 프로젝트의 인력명단이 없습니다. ‘👥 Human Resources’ 탭에서 먼저 인력을 등록하세요.")
+                st.text_input("Assignee (임시 직접입력)", value=prev_assignee, key=assignee_key)
+            # --------------------------------------------------------
+
+
+
+
+
+
+
+
+
+
+            default_priority = st.session_state.get(priority_key, "Medium")
+            priority = st.selectbox(
+                "Priority",
+                options=TASK_PRIORITY_OPTIONS,
+                index=TASK_PRIORITY_OPTIONS.index(default_priority) if default_priority in TASK_PRIORITY_OPTIONS else 1,
+                key=priority_key
+            )
+            status = st.selectbox("Status", options=TASK_STATUS_OPTIONS,
+                                  index=TASK_STATUS_OPTIONS.index(st.session_state.get(status_key,"To Do")),
+                                  key=status_key, on_change=_on_status_change)
+
+            start_date = st.date_input("Start Date", value=st.session_state.get(start_key, date.today()), key=start_key)
+            due_date   = st.date_input("Due Date",   value=st.session_state.get(due_key, date.today()), key=due_key)
+
+            # 날짜 유효성: Due >= Start
+            calc_days = business_days_inclusive(start_date, due_date)
+            invalid = False
+            if due_date < start_date:
+                st.error("⚠️ 종료일(Due Date)은 시작일(Start Date)보다 이전일 수 없습니다.")
+                invalid = True
+
+            if not edit_task_mode:
+                st.session_state[est_key] = float(calc_days)
+            st.number_input("Estimate (업무일)", min_value=0.0, step=0.5, key=est_key)
+            st.number_input("진행률(%)", min_value=0, max_value=100, step=1, key=progress_key, on_change=_on_progress_change)
+
+            if edit_task_mode and selected_task_id:
+                cols = st.columns(2)
+                with cols[0]:
+                    if st.button("저장(수정)", key=k("task","save_edit",selected_task_id)):
+                        if invalid:
+                            st.warning("입력 오류를 먼저 수정하세요.")
+                        else:
+                            df_t.loc[df_t["task_id"].astype(str) == str(selected_task_id), [
+                                "title","description","assignee","priority","status",
+                                "start_date","due_date","estimate_days","progress"
+                            ]] = [
+                                st.session_state[title_key],
+                                st.session_state[desc_key],
+                                st.session_state[assignee_key],
+                                st.session_state[priority_key],
+                                st.session_state[status_key],
+                                _safe_date_str(start_date),
+                                _safe_date_str(due_date),
+                                float(st.session_state[est_key]),
+                                int(st.session_state[progress_key]),
+                            ]
+                            _write_all(df_p, df_t, df_c, df_m, df_ct, df_bl, df_cf, df_hr)
+                            st.success("작업이 수정되었습니다.")
+                            st.rerun()
+                with cols[1]:
+                    if st.button("삭제(작업)", key=k("task","delete",selected_task_id)):
+                        df_t = df_t[df_t["task_id"].astype(str) != str(selected_task_id)]
+                        df_c = df_c[~((df_c["entity_type"].astype(object).map(_s).str.lower()=="task") & (df_c["entity_id"].astype(object).map(_s) == str(selected_task_id)))]
+                        df_t, df_c = _renumber_project_tasks(df_t, df_c, project_choice)
+                        _write_all(df_p, df_t, df_c, df_m, df_ct, df_bl, df_cf, df_hr)
+                        st.success("작업이 삭제되었고 task_id를 재채번했습니다.")
+                        st.rerun()
+            else:
+                if st.button("추가(신규 작업)", key=k("task","add_new")):
+                    if invalid:
+                        st.warning("입력 오류를 먼저 수정하세요.")
+                    elif not st.session_state[title_key]:
+                        st.error("Title은 필수입니다.")
+                    else:
+                        new_tid = _next_project_task_id(df_t, project_choice)
+                        df_t.loc[len(df_t)] = {
+                            "task_id": new_tid, "project_id": project_choice,
+                            "title": st.session_state[title_key],
+                            "description": st.session_state[desc_key],
+                            "assignee": st.session_state[assignee_key],
+                            "priority": st.session_state[priority_key],
+                            "status": st.session_state[status_key],
+                            "start_date": _safe_date_str(start_date),
+                            "due_date": _safe_date_str(due_date),
+                            "estimate_days": float(st.session_state[est_key]),
+                            "progress": int(st.session_state[progress_key]),
+                            "labels": "",
+                            "parent_task_id": ""
+                        }
+                        _write_all(df_p, df_t, df_c, df_m, df_ct, df_bl, df_cf, df_hr)
+                        st.success(f"작업 추가 완료: {new_tid}")
+                        st.rerun()
+
+# ───────── Kanban ─────────
+with tab_board:
+    st.subheader("칸반 보드")
+    if df_p.empty:
+        st.info("먼저 프로젝트를 추가해주세요.")
+    else:
+        project_choice = st.selectbox(
+            "프로젝트 선택 (칸반)",
+            options=safe_select_options(df_p["project_id"]),
+            format_func=safe_fmt_by(df_p, "project_id", "name"),
+            key=k("kanban","proj_choice")
+        )
+        board = df_t[df_t["project_id"].astype(str) == project_choice]
+        cols = st.columns(len(TASK_STATUS_OPTIONS))
+        for i, st_name in enumerate(TASK_STATUS_OPTIONS):
+            with cols[i]:
+                st.markdown(f"### {st_name}")
+                col_df = board[board["status"] == st_name]
+                for _, r in col_df.iterrows():
+                    with st.container(border=True):
+                        st.markdown(f"**#{_s(r['task_id'])}**  {_s(r['title'])}")
+                        if _s(r.get("assignee","")):
+                            st.caption(f"담당: {_s(r['assignee'])}")
+                        due = _safe_date_str(r.get("due_date",""))
+                        if due: st.caption(f"마감: {due}")
+                        new_status = st.selectbox(
+                            "상태 변경", options=TASK_STATUS_OPTIONS,
+                            index=TASK_STATUS_OPTIONS.index(st_name),
+                            key=k("kanban","move",project_choice,_s(r["task_id"]))
+                        )
+                        if new_status != st_name:
+                            if st.button(f"변경 저장 #{_s(r['task_id'])}", key=k("kanban","save",_s(r["task_id"]))):
+                                df_t.loc[df_t["task_id"] == r["task_id"], ["status"]] = [new_status]
+                                _write_all(df_p, df_t, df_c, df_m, df_ct, df_bl, df_cf, df_hr)
+                                st.success("상태가 변경되었습니다.")
+                                st.rerun()
+
+# ───────── Gantt ─────────
+with tab_gantt:
+    st.subheader("간단 간트 (Start~Due)")
+    if df_p.empty:
+        st.info("먼저 프로젝트를 추가해주세요.")
+    else:
+        project_choice = st.selectbox(
+            "프로젝트 선택 (간트)",
+            options=safe_select_options(df_p["project_id"]),
+            format_func=safe_fmt_by(df_p, "project_id", "name"),
+            key=k("gantt","proj_choice")
+        )
+        g = df_t[df_t["project_id"].astype(str) == project_choice].copy()
+        if g.empty:
+            st.info("표시할 작업이 없습니다.")
+        else:
+            g["start_date_parsed"] = pd.to_datetime(g["start_date"], errors="coerce")
+            g["due_date_parsed"]   = pd.to_datetime(g["due_date"],   errors="coerce")
+            g = g.dropna(subset=["start_date_parsed","due_date_parsed"])
+            if g.empty:
+                st.info("유효한 날짜 범위가 있는 작업이 없습니다.")
+            else:
+                fig = px.timeline(
+                    g, x_start="start_date_parsed", x_end="due_date_parsed",
+                    y="title", color="status", hover_data=["assignee","priority","labels"]
+                )
+                fig.update_yaxes(autorange="reversed")
+                fig.update_layout(margin=dict(l=0, r=0, t=24, b=0))
+                st.plotly_chart(fig, use_container_width=True)
+
+# ───────── Comments ─────────
+with tab_comments:
+    st.subheader("코멘트")
+    mode = st.radio("대상", options=["Project","Task"], horizontal=True, key=k("comment","mode"))
+    entity_df = df_p if mode == "Project" else df_t
+    if entity_df.empty:
+        st.info("먼저 대상 데이터를 추가해주세요.")
+    else:
+        id_col = "project_id" if mode == "Project" else "task_id"
+        if mode == "Project":
+            options_list = safe_select_options(df_p["project_id"])
+            fmt = safe_fmt_by(df_p, "project_id", "name")
+            entity_id = st.selectbox("Project 선택", options=options_list, key=k("comment","entity","project"),
+                                     format_func=lambda x: f"#{_s(x)} {fmt(x)}")
+        else:
+            options_list = safe_select_options(df_t["task_id"])
+            fmt = safe_fmt_by(df_t, "task_id", "title")
+            entity_id = st.selectbox("Task 선택", options=options_list, key=k("comment","entity","task"),
+                                     format_func=lambda x: f"#{_s(x)} {fmt(x)}")
+        st.markdown("**코멘트 추가**")
+        author = st.text_input("Author", key=k("comment","author"))
+        body   = st.text_area("Body", height=120, key=k("comment","body"))
+        if st.button("등록", key=k("comment","add")):
+            if not body:
+                st.error("Body는 필수입니다.")
+            else:
+                new_id, df_m = _next_id(df_m, "comment_id_seq")
+                df_c.loc[len(df_c)] = {
+                    "comment_id": new_id, "entity_type": mode.lower(), "entity_id": entity_id,
+                    "author": author, "body": body, "created_at": _now_iso()
+                }
+                _write_all(df_p, df_t, df_c, df_m, df_ct, df_bl, df_cf, df_hr)
+                st.success("코멘트가 추가되었습니다.")
+                st.rerun()
+        st.markdown("---")
+        st.markdown("**코멘트 목록**")
+
+        show = df_c[(df_c["entity_type"].astype(object).map(_s).str.lower()==mode.lower()) & (df_c["entity_id"].astype(object).map(_s)==_s(entity_id))]
+        st.dataframe(show.sort_values("created_at", ascending=False), width='stretch', height=400, hide_index=True)
+
+# ───────── Import/Export ─────────
+with tab_import:
+    st.subheader("Import / Export")
+    st.markdown("**엑셀 내보내기 안내** — 현재 폴더의 'pms_data.xlsx'가 최신 데이터 파일입니다.")
+    if st.button("전체 시트 Export (알림)", key=k("export","btn")):
+        st.success(f"같은 폴더의 '{DATA_FILE}' 파일을 사용 중입니다. 이 파일이 최신 데이터입니다.")
+    st.markdown("---")
+    st.markdown("**작업 대량 업로드 (CSV)** — 컬럼 예시: project_id,title,description,assignee,priority,status,start_date,due_date,estimate_days,labels,progress(선택)")
+    up = st.file_uploader("CSV 파일 선택", type=["csv"], key=k("tasks","csv","upload"))
+    if up is not None:
+        try:
+            up_df = pd.read_csv(up)
+            for col in ["project_id","title","start_date","due_date"]:
+                if col not in up_df.columns:
+                    st.error(f"필수 컬럼 '{col}' 이(가) 없습니다.")
+                    up_df = None
+                    break
+            if up_df is not None and st.button("업로드 적용", key=k("tasks","csv","apply")):
+                cnt = 0
+                skipped = 0
+                for _, r in up_df.iterrows():
+                    pid = _s(r.get("project_id",""))
+                    if not pid:
+                        skipped += 1; continue
+                    # 날짜 유효성: due >= start (CSV에도 강제)
+                    sd = _parse_date_maybe(r.get("start_date",""))
+                    dd = _parse_date_maybe(r.get("due_date",""))
+                    if sd is None or dd is None or dd < sd:
+                        skipped += 1; continue
+                    new_tid = _next_project_task_id(df_t, pid)
+                    df_t.loc[len(df_t)] = {
+                        "task_id": new_tid,
+                        "project_id": pid,
+                        "parent_task_id": "",
+                        "title": _s(r.get("title","")),
+                        "description": _s(r.get("description","")),
+                        "assignee": _s(r.get("assignee","")),
+                        "priority": _s(r.get("priority","Medium")),
+                        "status": _s(r.get("status","To Do")),
+                        "start_date": _safe_date_str(sd),
+                        "due_date": _safe_date_str(dd),
+                        "estimate_days": float(pd.to_numeric(r.get("estimate_days", 0.0), errors="coerce") or 0.0),
+                        "labels": _s(r.get("labels","")),
+                        "progress": int(pd.to_numeric(r.get("progress", 0), errors="coerce") or 0)
+                    }
+                    cnt += 1
+                _write_all(df_p, df_t, df_c, df_m, df_ct, df_bl, df_cf, df_hr)
+                st.success(f"{cnt}건의 작업이 등록되었습니다. (무시 {skipped}건: 날짜 누락/역전 등)")
+                st.rerun()
+        except Exception as e:
+            st.error(f"업로드 실패: {e}")
